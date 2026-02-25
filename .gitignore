@@ -16,8 +16,11 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files
-.env*
+# env files (all three: root, outlrn-backend, KOKORO backend)
+.env
+.env.*
+*.env
+!.env.example
 
 # vercel
 .vercel
@@ -25,3 +28,28 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+uv.lock
+
+# misc
+*.stackdump
+kokoro_payload.json
+kokoro_test.json
+kokoro_test_payload.json

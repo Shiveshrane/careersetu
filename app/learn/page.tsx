@@ -6,7 +6,7 @@ import mermaid from 'mermaid';
 import { motion, AnimatePresence, LayoutGroup, Variants } from 'framer-motion';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { createClient } from '@supabase/supabase-js'; 
+// import { createClient } from '@supabase/supabase-js'; 
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import dynamic from 'next/dynamic';
 
@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 
 // --- External Imports ---
-import { TalkingHead } from "../../lib/modules/talkinghead.mjs"; 
+import { TalkingHead } from "../../lib/modules/talkinghead.mjs";
 import { KokoroAdapter } from "../../lib/modules/KokoroAdapter.js"; 
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -39,9 +39,9 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { cn } from '../../lib/utils';
 
 // --- SUPABASE SETUP ---
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+// const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+// const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // --- TYPES ---
 type LayoutMode = 'CONCEPT_MODE' | 'SPLIT_MODE' | 'FOCUS_MODE' | 'VISUAL_MODE';
@@ -69,6 +69,7 @@ interface Session {
 
 type PlaybackAction = 
   | { type: 'SPEAK'; text: string }
+  | { type: 'BACKEND_AUDIO'; text: string; chunks: string[] }
   | { type: 'LAYOUT'; mode: LayoutMode }
   | { type: 'CODE'; code: string }
   | { type: 'CONCEPT'; title: string; text: string }
@@ -79,6 +80,11 @@ type PlaybackAction =
 // --- CONFIGURATION ---
 const ANIMATION_SPRING = { type: "spring", stiffness: 300, damping: 30 };
 const MERMAID_ID_PREFIX = 'immersive-mermaid-';
+const OUTLRN_BACKEND_URL = process.env.NEXT_PUBLIC_OUTLRN_BACKEND_URL || 'http://127.0.0.1:8000';
+const KOKORO_BACKEND_URL = process.env.NEXT_PUBLIC_KOKORO_BACKEND_URL || 'http://127.0.0.1:8001';
+const LOCAL_AUTH_BYPASS =
+  process.env.NEXT_PUBLIC_LOCAL_AUTH_BYPASS === 'true' ||
+  (process.env.NODE_ENV === 'development' && process.env.NEXT_PUBLIC_LOCAL_AUTH_BYPASS !== 'false');
 
 // UI Animation Variants
 const PANEL_VARIANTS: Variants = {
@@ -185,23 +191,29 @@ const AuthModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }
   const [error, setError] = useState<string | null>(null);
 
   const handleGoogleLogin = async () => {
+    if (LOCAL_AUTH_BYPASS) {
+      setLoading(false);
+      setError(null);
+      onClose();
+      return;
+    }
     setLoading(true);
     setError(null);
     if (typeof window !== 'undefined') {
         localStorage.setItem('auth_return_url', window.location.href);
     }
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: window.location.href, 
-          queryParams: {
-            access_type: 'offline', 
-            prompt: 'consent',
-          },
-        },
-      });
-      if (error) throw error;
+      // const { error } = await supabase.auth.signInWithOAuth({
+      //   provider: 'google',
+      //   options: {
+      //     redirectTo: window.location.href, 
+      //     queryParams: {
+      //       access_type: 'offline', 
+      //       prompt: 'consent',
+      //     },
+      //   },
+      // });
+      // if (error) throw error;
     } catch (err: any) {
       setError(err.message);
       setLoading(false);
@@ -791,10 +803,12 @@ const [showShareOverlay, setShowShareOverlay] = useState(false); // <--- ADD THI
   const hasInitializedRef = useRef(false); 
   const lastAuthUserRef = useRef<string | null>(null); // <--- ADD THIS
   const avatarRef = useRef<HTMLDivElement>(null);
-  const headRef = useRef<any>(null);
+  const headRef = useRef<TalkingHead | null>(null);
   
   const adapterRef = useRef<any>(null); 
-  const currentVoiceIdRef = useRef<string>("af_bella"); 
+  const currentVoiceIdRef = useRef<string>("af_bella");
+  const ttsReadyRef = useRef<boolean>(false); // true once head.start() has been called
+  const isTTSActiveRef = useRef<boolean>(true); // mirrors isTTSActive state to avoid stale closures
 
   const codeContainerRef = useRef<HTMLDivElement>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
@@ -802,9 +816,16 @@ const [showShareOverlay, setShowShareOverlay] = useState(false); // <--- ADD THI
   const isExecutingRef = useRef(false);
   const subtitleTimerRef = useRef<NodeJS.Timeout | null>(null);
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const latestCodeRef = useRef<string>("");
+  const graphBaseRef = useRef<any>(null);
+  const pendingBackendAudioTextRef = useRef<string>("");
+  const pendingBackendAudioChunksRef = useRef<string[]>([]);
   
   // --- RECORDING BUFFER (For Saving Replays) ---
   const recordingBufferRef = useRef<PlaybackAction[]>([]);
+
+  // Keep isTTSActiveRef in sync with state
+  useEffect(() => { isTTSActiveRef.current = isTTSActive; }, [isTTSActive]);
 
   // --- PERSISTENCE: Save Snapshot State ---
   const saveSessionState = useCallback(async () => {
@@ -814,13 +835,13 @@ const [showShareOverlay, setShowShareOverlay] = useState(false); // <--- ADD THI
 
     saveTimeoutRef.current = setTimeout(async () => {
         try {
-            await supabase.from('session_states').upsert({
-                session_id: activeSessionId,
-                concept_history: conceptHistory,
-                code_history: codeHistory,
-                visual_history: visualHistory,
-                indices: { concept: conceptIndex, code: codeIndex, visual: visualIndex }
-            });
+            // await supabase.from('session_states').upsert({
+            //     session_id: activeSessionId,
+            //     concept_history: conceptHistory,
+            //     code_history: codeHistory,
+            //     visual_history: visualHistory,
+            //     indices: { concept: conceptIndex, code: codeIndex, visual: visualIndex }
+            // });
         } catch (e) {
             console.error("Failed to save state:", e);
         }
@@ -829,10 +850,10 @@ const [showShareOverlay, setShowShareOverlay] = useState(false); // <--- ADD THI
 
 
   const fetchUserUsage = useCallback(async (userId: string) => {
-  const { data } = await supabase.from('user_usage').select('credits_used').eq('user_id', userId).single();
-  // We store "tokens" in the same credits_used column
-  if (data) setTokensUsed(data.credits_used);
-  else await supabase.from('user_usage').insert({ user_id: userId, credits_used: 0 });
+  // const { data } = await supabase.from('user_usage').select('credits_used').eq('user_id', userId).single();
+  // // We store "tokens" in the same credits_used column
+  // if (data) setTokensUsed(data.credits_used);
+  // else await supabase.from('user_usage').insert({ user_id: userId, credits_used: 0 });
 }, []);
 
 const incrementUsage = async (messageText: string) => {
@@ -843,11 +864,11 @@ const incrementUsage = async (messageText: string) => {
   const newTotal = tokensUsed + estimatedTokens;
   
   setTokensUsed(newTotal);
-  await supabase.from('user_usage').upsert({ 
-    user_id: user.id, 
-    credits_used: newTotal, 
-    updated_at: new Date().toISOString() 
-  });
+  // await supabase.from('user_usage').upsert({ 
+  //   user_id: user.id, 
+  //   credits_used: newTotal, 
+  //   updated_at: new Date().toISOString() 
+  // });
 };
 
 
@@ -862,11 +883,12 @@ const incrementUsage = async (messageText: string) => {
   // --- LOGIC: Initialize App ---
   const fetchSessionsAndInit = async (userId: string) => {
     fetchUserUsage(userId);
-    const { data: userSessions, error } = await supabase
-      .from('chat_sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false });
+    // const { data: userSessions, error } = await supabase
+    //   .from('chat_sessions')
+    //   .select('*')
+    //   .eq('user_id', userId)
+    //   .order('created_at', { ascending: false });
+    const userSessions: any[] = []; const error = null;
 
     if (!error) setSessions(userSessions || []);
 
@@ -878,14 +900,15 @@ const incrementUsage = async (messageText: string) => {
         setActiveSessionId(urlSessionId);
         
         // --- NEW: FETCH PERSISTED MESSAGES ---
-        const { data: dbMessages } = await supabase
-            .from('chat_messages')
-            .select('*')
-            .eq('session_id', urlSessionId)
-            .order('created_at', { ascending: true });
+        // const { data: dbMessages } = await supabase
+        //     .from('chat_messages')
+        //     .select('*')
+        //     .eq('session_id', urlSessionId)
+        //     .order('created_at', { ascending: true });
+        const dbMessages: any[] = [];
 
         if (dbMessages && dbMessages.length > 0) {
-            setMessages(dbMessages.map(m => ({
+            setMessages(dbMessages.map((m: any) => ({
                 id: m.id,
                 role: m.role as 'user' | 'assistant',
                 content: m.content,
@@ -897,11 +920,12 @@ const incrementUsage = async (messageText: string) => {
         }
         // -------------------------------------
 
-        const { data: stateData } = await supabase
-            .from('session_states')
-            .select('*')
-            .eq('session_id', urlSessionId)
-            .single();
+        // const { data: stateData } = await supabase
+        //     .from('session_states')
+        //     .select('*')
+        //     .eq('session_id', urlSessionId)
+        //     .single();
+        const stateData: any = null;
 
         if (stateData) {
             setConceptHistory(stateData.concept_history || [{ title: "Session Resumed", text: "Context restored." }]);
@@ -940,11 +964,12 @@ const incrementUsage = async (messageText: string) => {
     if (shareInteractionId && !hasInitializedRef.current) {
         hasInitializedRef.current = true;
         const loadShare = async () => {
-            const { data, error } = await supabase
-                .from('session_interactions')
-                .select('*')
-                .eq('id', shareInteractionId)
-                .single();
+            // const { data, error } = await supabase
+            //     .from('session_interactions')
+            //     .select('*')
+            //     .eq('id', shareInteractionId)
+            //     .single();
+            const data: any = null; const error: any = null;
             
             if (data && data.actions) {
                 // FIX: Update the History Array, not the old state variable
@@ -974,65 +999,67 @@ const incrementUsage = async (messageText: string) => {
     // The clean-up function handles the subscription correctly.
 
     // 2. Initial Session Check
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      // Only set user if we haven't processed this user yet to prevent flicker
-      if (session?.user && session.user.id !== lastAuthUserRef.current) {
-         setUser(session.user);
-         fetchSessionsAndInit(session.user.id);
-      } else if (!session?.user) {
-         // Handle case where user loads page but is not logged in
-         const urlId = searchParams.get('session_id');
-         if (urlId) setActiveSessionId(urlId);
-         else setActiveSessionId(null);
-      }
-    });
+    // supabase.auth.getSession().then(({ data: { session } }) => {
+    //   // Only set user if we haven't processed this user yet to prevent flicker
+    //   if (session?.user && session.user.id !== lastAuthUserRef.current) {
+    //      setUser(session.user);
+    //      fetchSessionsAndInit(session.user.id);
+    //   } else if (!session?.user) {
+    //      // Handle case where user loads page but is not logged in
+    //      const urlId = searchParams.get('session_id');
+    //      if (urlId) setActiveSessionId(urlId);
+    //      else setActiveSessionId(null);
+    //   }
+    // });
 
     // 3. The Listener (Must remain active)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      const currentUserId = session?.user?.id;
+    // const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    //   const currentUserId = session?.user?.id;
+    //
+    //   // This logic you added previously is good! It prevents double-fetching.
+    //   if (currentUserId === lastAuthUserRef.current) return;
+    //   lastAuthUserRef.current = currentUserId ?? null;
+    //
+    //   setUser(session?.user ?? null);
+    //   
+    //   if (session?.user) {
+    //     setShowAuthModal(false);
+    //     // Clean URL hash (access tokens)
+    //     if (window.location.hash && window.location.hash.includes('access_token')) {
+    //          const cleanUrl = window.location.pathname + window.location.search;
+    //          window.history.replaceState(null, '', cleanUrl);
+    //     }
+    //     
+    //     // Handle Return URL redirect
+    //     const returnUrl = localStorage.getItem('auth_return_url');
+    //     if (returnUrl) {
+    //         localStorage.removeItem('auth_return_url'); 
+    //         const currentPath = window.location.href.split('#')[0];
+    //         const targetPath = returnUrl.split('#')[0];
+    //         if (currentPath !== targetPath) {
+    //             window.location.href = returnUrl; 
+    //             return; 
+    //         }
+    //     }
+    //     fetchSessionsAndInit(session.user.id);
+    //   } else {
+    //     // Logout cleanup
+    //     setSessions([]); 
+    //     setActiveSessionId(null);
+    //     // Only replace state if we aren't already at the root to avoid loops
+    //     if (window.location.search) {
+    //          window.history.replaceState(null, '', window.location.pathname); 
+    //     }
+    //     setMessages([{ id: 'init', role: 'assistant', content: "Signed out. System reset.", timestamp: Date.now() }]);
+    //   }
+    // });
 
-      // This logic you added previously is good! It prevents double-fetching.
-      if (currentUserId === lastAuthUserRef.current) return;
-      lastAuthUserRef.current = currentUserId ?? null;
-
-      setUser(session?.user ?? null);
-      
-      if (session?.user) {
-        setShowAuthModal(false);
-        // Clean URL hash (access tokens)
-        if (window.location.hash && window.location.hash.includes('access_token')) {
-             const cleanUrl = window.location.pathname + window.location.search;
-             window.history.replaceState(null, '', cleanUrl);
-        }
-        
-        // Handle Return URL redirect
-        const returnUrl = localStorage.getItem('auth_return_url');
-        if (returnUrl) {
-            localStorage.removeItem('auth_return_url'); 
-            const currentPath = window.location.href.split('#')[0];
-            const targetPath = returnUrl.split('#')[0];
-            if (currentPath !== targetPath) {
-                window.location.href = returnUrl; 
-                return; 
-            }
-        }
-        fetchSessionsAndInit(session.user.id);
-      } else {
-        // Logout cleanup
-        setSessions([]); 
-        setActiveSessionId(null);
-        // Only replace state if we aren't already at the root to avoid loops
-        if (window.location.search) {
-             window.history.replaceState(null, '', window.location.pathname); 
-        }
-        setMessages([{ id: 'init', role: 'assistant', content: "Signed out. System reset.", timestamp: Date.now() }]);
-      }
-    });
-
-    return () => subscription.unsubscribe();
+    // return () => subscription.unsubscribe();
+    return () => {};
   }, [shareInteractionId]); // Keep dependency array minimal
 
   const requireAuth = () => {
+    if (LOCAL_AUTH_BYPASS) return true;
     if (!user) {
       setShowAuthModal(true);
       return false;
@@ -1041,7 +1068,7 @@ const incrementUsage = async (messageText: string) => {
   };
 
   const handleLogout = async () => {
-    await supabase.auth.signOut();
+    // await supabase.auth.signOut();
     setIsSidebarOpen(false);
     hasInitializedRef.current = false; 
     window.location.href = "/learn";
@@ -1056,14 +1083,15 @@ const incrementUsage = async (messageText: string) => {
       window.history.pushState(null, '', newPath);
       
       // --- NEW: FETCH PERSISTED MESSAGES ---
-      const { data: dbMessages } = await supabase
-        .from('chat_messages')
-        .select('*')
-        .eq('session_id', sessionId)
-        .order('created_at', { ascending: true });
+      // const { data: dbMessages } = await supabase
+      //   .from('chat_messages')
+      //   .select('*')
+      //   .eq('session_id', sessionId)
+      //   .order('created_at', { ascending: true });
+      const dbMessages: any[] = [];
 
       if (dbMessages && dbMessages.length > 0) {
-        setMessages(dbMessages.map(m => ({
+        setMessages(dbMessages.map((m: any) => ({
             id: m.id,
             role: m.role as 'user' | 'assistant',
             content: m.content,
@@ -1074,7 +1102,8 @@ const incrementUsage = async (messageText: string) => {
         setMessages([{ id: Date.now().toString(), role: 'assistant', content: "Session loaded.", timestamp: Date.now() }]);
       }
       
-      const { data: stateData } = await supabase.from('session_states').select('*').eq('session_id', sessionId).single();
+      // const { data: stateData } = await supabase.from('session_states').select('*').eq('session_id', sessionId).single();
+      const stateData: any = null;
 
       if (stateData) {
             setConceptHistory(stateData.concept_history || []);
@@ -1125,17 +1154,22 @@ const incrementUsage = async (messageText: string) => {
   useEffect(() => {
     if (headRef.current) return;
     const initAvatar = async () => {
+      if (!avatarRef.current) return;
       try {
         const head = new TalkingHead(avatarRef.current, {
           ttsEndpoint: "N/A", cameraView: "upper", mixerGainSpeech: 3, cameraRotateEnable: false
         });
         headRef.current = head;
-        const adapter = new KokoroAdapter("https://lathlike-lyman-supply.ngrok-free.dev");
+        const adapter = new KokoroAdapter(KOKORO_BACKEND_URL);
         adapterRef.current = adapter;
+        // AudioContext is created in TalkingHead constructor; mark TTS ready immediately.
+        // head.start() requires armature (3D avatar) - it's a no-op in headless mode,
+        // so we set ttsReadyRef here unconditionally.
+        ttsReadyRef.current = true;
         try {
-            await head.showAvatar({ url: "/avatars/david.glb", body: "F", avatarMood: "neutral" });
+          await (head as any).showAvatar({ url: "/avatars/david.glb", body: "F", avatarMood: "neutral" });
             head.setView(head.viewName, { cameraY: 0 });
-            head.start();
+            head.start(); // start animation loop + audio graph (requires armature set by showAvatar)
             setAvatarStatus("Online");
             currentVoiceIdRef.current = "am_fenrir"; 
         } catch (innerErr) {
@@ -1162,6 +1196,148 @@ const incrementUsage = async (messageText: string) => {
       }
   };
 
+  const queueAction = (action: PlaybackAction) => {
+    console.log('[QUEUE] Queuing action:', action.type, action.type === 'SPEAK' ? (action as any).text?.substring(0, 50) : '');
+    commandQueueRef.current.push(action);
+    if (action.type === 'BACKEND_AUDIO') {
+      recordingBufferRef.current.push({ type: 'SPEAK', text: action.text });
+    } else {
+      recordingBufferRef.current.push(action);
+    }
+    processQueue();
+  };
+
+  const parseGraphData = (graph: any) => {
+    const rawNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    const rawLinks = Array.isArray(graph?.links)
+      ? graph.links
+      : Array.isArray(graph?.edges)
+      ? graph.edges
+      : [];
+
+    const nodes = rawNodes.map((node: any, idx: number) => {
+      const nodeId = node?.id ?? node?.name ?? node?.label ?? `${idx}`;
+      return {
+        ...node,
+        id: String(nodeId),
+        label: String(node?.label ?? nodeId),
+      };
+    });
+
+    const links = rawLinks.map((link: any) => ({
+      ...link,
+      source: String(link?.source ?? link?.from ?? link?.u ?? ''),
+      target: String(link?.target ?? link?.to ?? link?.v ?? ''),
+    }));
+
+    return { nodes, links };
+  };
+
+  const parseActiveNodes = (framePayload: any): string[] => {
+    const candidates = [
+      framePayload?.active_nodes,
+      framePayload?.activeNodes,
+      framePayload?.visited,
+      framePayload?.frontier,
+      framePayload?.current,
+      framePayload?.node,
+    ];
+
+    const result = new Set<string>();
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate)) {
+        candidate.forEach((value) => result.add(String(value)));
+      } else if (candidate !== undefined && candidate !== null) {
+        result.add(String(candidate));
+      }
+    }
+    return Array.from(result);
+  };
+
+  const parseActiveEdges = (framePayload: any): string[][] => {
+    const edgeCandidates = framePayload?.active_edges ?? framePayload?.activeEdges ?? framePayload?.edges ?? [];
+    if (!Array.isArray(edgeCandidates)) return [];
+
+    return edgeCandidates
+      .map((edge: any) => {
+        if (Array.isArray(edge) && edge.length >= 2) return [String(edge[0]), String(edge[1])];
+        if (edge && typeof edge === 'object') {
+          const source = edge.source ?? edge.from ?? edge.u;
+          const target = edge.target ?? edge.to ?? edge.v;
+          if (source !== undefined && target !== undefined) return [String(source), String(target)];
+        }
+        return null;
+      })
+      .filter(Boolean) as string[][];
+  };
+
+  const mergeBase64Chunks = (chunks: string[]): ArrayBuffer => {
+    const byteArrays = chunks.map((chunk) => Uint8Array.from(atob(chunk), (char) => char.charCodeAt(0)));
+    const totalLength = byteArrays.reduce((acc, arr) => acc + arr.length, 0);
+    const merged = new Uint8Array(totalLength);
+    let offset = 0;
+
+    for (const arr of byteArrays) {
+      merged.set(arr, offset);
+      offset += arr.length;
+    }
+
+    return merged.buffer;
+  };
+
+  const playBackendAudioOnAvatar = async (text: string, chunks: string[]): Promise<boolean> => {
+    const head = headRef.current as any;
+    if (!head || chunks.length === 0) return false;
+
+    try {
+      if (head.audioCtx?.state === 'suspended') {
+        await head.audioCtx.resume();
+      }
+      if (!head.audioCtx) return false;
+
+      const mergedBuffer = mergeBase64Chunks(chunks);
+      const decodedAudio = await head.audioCtx.decodeAudioData(mergedBuffer.slice(0));
+      const words = (text || '').trim().split(/\s+/).filter(Boolean);
+
+      const totalDurationMs = Math.max(decodedAudio.duration * 1000, 1);
+      const totalChars = Math.max(words.reduce((sum, word) => sum + word.length, 0), 1);
+      const msPerChar = totalDurationMs / totalChars;
+      let cursor = 0;
+      const wtimes: number[] = [];
+      const wdurations: number[] = [];
+
+      words.forEach((word) => {
+        const duration = Math.max(word.length * msPerChar, 20);
+        wtimes.push(cursor);
+        wdurations.push(duration);
+        cursor += duration;
+      });
+
+      await new Promise<void>((resolve) => {
+        head.speakAudio(
+          {
+            audio: decodedAudio as any,
+            words,
+            wtimes,
+            wdurations,
+          },
+          {},
+          (word: string) => setSubtitleText(word)
+        );
+        head.speakMarker(() => {
+          setSubtitles('');
+          resolve();
+          return head;
+        });
+      });
+
+      return true;
+    } catch (error) {
+      console.warn('Failed to play backend audio on avatar. Falling back to local TTS flow.', error);
+      return false;
+    }
+  };
+
   const processQueue = async () => {
     if (isExecutingRef.current) return; 
     isExecutingRef.current = true;
@@ -1176,6 +1352,7 @@ const incrementUsage = async (messageText: string) => {
           setLayoutMode(action.mode);
           break;
         case 'CODE':
+          latestCodeRef.current = action.code.trim();
           setCodeHistory(prev => {
              const newIndex = prev.length;
              setCodeIndex(newIndex); 
@@ -1208,7 +1385,58 @@ const incrementUsage = async (messageText: string) => {
         case 'WAIT':
           await new Promise(resolve => setTimeout(resolve, action.ms));
           break;
+        case 'BACKEND_AUDIO': {
+          // Ensure AudioContext is running before any audio call
+          if (headRef.current?.audioCtx?.state === 'suspended') {
+            try { await headRef.current.audioCtx.resume(); } catch(e) {}
+          }
+          if (action.text) {
+            setMessages(prev => {
+              const last = prev[prev.length - 1];
+              if (last.role === 'assistant') {
+                return [...prev.slice(0, -1), { ...last, content: `${last.content} ${action.text}`.trim() }];
+              }
+              return [...prev, { id: Date.now().toString(), role: 'assistant', content: action.text, timestamp: Date.now() }];
+            });
+          }
+
+          const played = isTTSActiveRef.current
+            ? await playBackendAudioOnAvatar(action.text, action.chunks)
+            : false;
+
+          if (!played) {
+            if (isTTSActiveRef.current && adapterRef.current && ttsReadyRef.current) {
+              setSubtitles("");
+              try {
+                if (headRef.current?.audioCtx?.state === 'suspended') await headRef.current.audioCtx.resume();
+              } catch (resumeErr) {
+                console.warn("[TTS] AudioContext resume failed:", resumeErr);
+              }
+              await new Promise<void>((resolve) => {
+                adapterRef.current.streamToAvatar(
+                  headRef.current,
+                  action.text,
+                  currentVoiceIdRef.current,
+                  null,
+                  (word: string) => setSubtitleText(word),
+                  () => { setSubtitles(""); resolve(); }
+                ).catch((e: any) => {
+                  console.error("[TTS] streamToAvatar failed:", e);
+                  resolve();
+                });
+              });
+            } else {
+              await new Promise(resolve => setTimeout(resolve, Math.max(action.text.length, 1) * 40));
+            }
+          }
+          break;
+        }
         case 'SPEAK':
+          // Ensure AudioContext is running before any Kokoro/TalkingHead audio call
+          if (headRef.current?.audioCtx?.state === 'suspended') {
+            try { await headRef.current.audioCtx.resume(); } catch(e) {}
+          }
+          console.log('[SPEAK] Processing SPEAK action. isTTSActive:', isTTSActiveRef.current, 'adapterRef:', !!adapterRef.current, 'ttsReady:', ttsReadyRef.current, 'audioCtx state:', headRef.current?.audioCtx?.state);
           setMessages(prev => {
             const last = prev[prev.length - 1];
             if (last.role === 'assistant') {
@@ -1218,20 +1446,25 @@ const incrementUsage = async (messageText: string) => {
             }
           });
           
-          if (isTTSActive && adapterRef.current && avatarStatus !== "Offline") {
+          if (isTTSActiveRef.current && adapterRef.current && ttsReadyRef.current) {
               setSubtitles("");
-              if (headRef.current?.audioCtx?.state === 'suspended') await headRef.current.audioCtx.resume();
+              try {
+                if (headRef.current?.audioCtx?.state === 'suspended') await headRef.current.audioCtx.resume();
+              } catch (resumeErr) {
+                console.warn("[TTS] AudioContext resume failed:", resumeErr);
+              }
               await new Promise<void>((resolve) => {
-                  try {
-                      adapterRef.current.streamToAvatar(
-                          headRef.current,
-                          action.text,
-                          currentVoiceIdRef.current,
-                          null, 
-                          (word: string) => setSubtitleText(word), 
-                          () => { setSubtitles(""); resolve(); }
-                      );
-                  } catch (e) { resolve(); }
+                  adapterRef.current.streamToAvatar(
+                      headRef.current,
+                      action.text,
+                      currentVoiceIdRef.current,
+                      null, 
+                      (word: string) => setSubtitleText(word), 
+                      () => { setSubtitles(""); resolve(); }
+                  ).catch((e: any) => {
+                    console.error("[TTS] streamToAvatar failed:", e);
+                    resolve();
+                  });
               });
           } else {
             await new Promise(resolve => setTimeout(resolve, action.text.length * 50)); 
@@ -1249,6 +1482,201 @@ const incrementUsage = async (messageText: string) => {
     try {
       const cleanLine = line.replace(/^data: /, '');
       const data = JSON.parse(cleanLine);
+
+      if (data.type === 'audio_start') {
+        pendingBackendAudioTextRef.current = data.text || '';
+        pendingBackendAudioChunksRef.current = [];
+        return;
+      }
+
+      if (data.type === 'audio_chunk') {
+        if (data.data) pendingBackendAudioChunksRef.current.push(String(data.data));
+        return;
+      }
+
+      if (data.type === 'audio_done') {
+        const text = pendingBackendAudioTextRef.current || '';
+        const chunks = [...pendingBackendAudioChunksRef.current];
+        pendingBackendAudioTextRef.current = '';
+        pendingBackendAudioChunksRef.current = [];
+
+        if (text || chunks.length > 0) {
+          queueAction({ type: 'BACKEND_AUDIO', text, chunks });
+        }
+        return;
+      }
+
+      if (data.type === 'content_card') {
+        queueAction({
+          type: 'CONCEPT',
+          title: data.title || 'Learning Note',
+          text: typeof data.body === 'string' ? data.body : JSON.stringify(data.body ?? ''),
+        });
+        return;
+      }
+
+      if (data.type === 'visual') {
+        if (data.visual_type === 'MERMAID') {
+          queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+          queueAction({
+            type: 'VISUAL',
+            state: {
+              type: 'MERMAID_FLOWCHART',
+              payload: { chart: data.payload?.code || data.payload?.chart || '' },
+              caption: data.payload?.description || 'Diagram generated',
+            },
+          });
+          return;
+        }
+
+        if (data.visual_type === 'BROWSER') {
+          queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+          queueAction({
+            type: 'VISUAL',
+            state: {
+              type: 'BROWSER',
+              payload: { code: data.payload?.html || data.payload?.code || '', ui: data.payload?.ui || null },
+              caption: data.payload?.description || 'UI Sandbox',
+            },
+          });
+          return;
+        }
+      }
+
+      if (data.type === 'animation_start') {
+        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({
+          type: 'CONCEPT',
+          title: 'Animation Started',
+          text: `Playing ${data.animation_type || 'algorithm'} (${data.total_frames || 0} frames).`,
+        });
+        return;
+      }
+
+      if (data.type === 'frame') {
+        const framePayload = data.payload || {};
+        const arrayData: any[] = Array.isArray(framePayload.array) ? framePayload.array : [];
+        const activeRange = Array.isArray(framePayload.activeRange) ? framePayload.activeRange : null;
+        const dimmedIndices = activeRange
+          ? arrayData
+              .map((_: any, idx: number) => idx)
+              .filter((idx: number) => idx < activeRange[0] || idx > activeRange[1])
+          : [];
+
+        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({
+          type: 'VISUAL',
+          state: {
+            type: 'ARRAY',
+            payload: {
+              data: arrayData,
+              pointers: framePayload.pointers || {},
+              highlights: framePayload.highlights || [],
+              dimmed_indices: dimmedIndices,
+            },
+            caption: framePayload.label || `Frame ${(data.index ?? 0) + 1}`,
+          },
+        });
+
+        if (framePayload.label) {
+          queueAction({
+            type: 'CONCEPT',
+            title: `Frame ${(data.index ?? 0) + 1}/${data.total || '?'}`,
+            text: framePayload.label,
+          });
+        }
+        return;
+      }
+
+      if (data.type === 'code_explainer_start') {
+        queueAction({ type: 'LAYOUT', mode: 'FOCUS_MODE' });
+        queueAction({ type: 'CODE', code: data.code || '' });
+        if (data.title) {
+          queueAction({
+            type: 'CONCEPT',
+            title: data.title,
+            text: `Starting code walkthrough (${data.total_segments || 0} segments).`,
+          });
+        }
+        return;
+      }
+
+      if (data.type === 'code_segment') {
+        const [startLine, endLine] = Array.isArray(data.lines) ? data.lines : [1, 1];
+        const codeLines = latestCodeRef.current.split('\n');
+        const highlightSource = codeLines[Math.max(0, (startLine || 1) - 1)] || '';
+        const highlightQuery = highlightSource.trim();
+
+        if (highlightQuery) {
+          queueAction({ type: 'HIGHLIGHT', code_to_highlight: highlightQuery });
+        }
+
+        queueAction({
+          type: 'CONCEPT',
+          title: `Code Segment ${(data.index ?? 0) + 1}/${data.total || '?'}`,
+          text: data.explanation || `Explaining lines ${startLine}-${endLine}.`,
+        });
+        return;
+      }
+
+      if (data.type === 'graph_start') {
+        const normalizedGraph = parseGraphData(data.graph || {});
+        graphBaseRef.current = normalizedGraph;
+        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({
+          type: 'VISUAL',
+          state: {
+            type: 'NETWORK',
+            payload: {
+              ...normalizedGraph,
+              activeNodes: [],
+              activeEdges: [],
+            },
+            caption: `${data.graph_type || 'Graph'} animation`,
+          },
+        });
+        return;
+      }
+
+      if (data.type === 'graph_frame') {
+        const framePayload = data.payload || {};
+        const baseGraph = graphBaseRef.current || { nodes: [], links: [] };
+        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({
+          type: 'VISUAL',
+          state: {
+            type: 'NETWORK',
+            payload: {
+              ...baseGraph,
+              activeNodes: parseActiveNodes(framePayload),
+              activeEdges: parseActiveEdges(framePayload),
+            },
+            caption: framePayload.label || `Graph frame ${(data.index ?? 0) + 1}`,
+          },
+        });
+
+        if (framePayload.label) {
+          queueAction({
+            type: 'CONCEPT',
+            title: `Graph Frame ${(data.index ?? 0) + 1}/${data.total || '?'}`,
+            text: framePayload.label,
+          });
+        }
+        return;
+      }
+
+      if (data.type === 'checkpoint') {
+        const optionLabels = Array.isArray(data.options)
+          ? data.options.map((opt: any) => `• ${opt.label}`).join('\n')
+          : '';
+        queueAction({
+          type: 'CONCEPT',
+          title: data.title || 'Checkpoint',
+          text: optionLabels || 'Checkpoint reached.',
+        });
+        return;
+      }
+
       const map: Record<string, PlaybackAction> = {
         'speak': { type: 'SPEAK', text: data.text },
         'layout': { type: 'LAYOUT', mode: data.mode },
@@ -1259,6 +1687,7 @@ const incrementUsage = async (messageText: string) => {
       };
       
       if (map[data.type]) {
+        console.log('[SSE] Mapped event type:', data.type, 'to action:', map[data.type]?.type);
 
 
         if (data.type === 'visual' && data.state?.type === 'BROWSER') {
@@ -1266,12 +1695,7 @@ const incrementUsage = async (messageText: string) => {
             commandQueueRef.current.push(autoLayoutAction);
             recordingBufferRef.current.push(autoLayoutAction);
         }
-        // 1. Add to live queue
-        commandQueueRef.current.push(map[data.type]);
-        // 2. Add to recording buffer
-        recordingBufferRef.current.push(map[data.type]);
-        
-        processQueue(); 
+        queueAction(map[data.type]);
       }
     } catch (e) { console.warn("Parse Error:", line); }
   };
@@ -1280,11 +1704,12 @@ const incrementUsage = async (messageText: string) => {
   const handleReplay = async (interactionId: string) => {
       if (isPlaying || !interactionId) return;
       
-      const { data, error } = await supabase
-        .from('session_interactions')
-        .select('actions')
-        .eq('id', interactionId)
-        .single();
+      // const { data, error } = await supabase
+      //   .from('session_interactions')
+      //   .select('actions')
+      //   .eq('id', interactionId)
+      //   .single();
+      const data: any = null;
 
       if (data && data.actions) {
           // Force update concept to avoid duplicate skip
@@ -1305,6 +1730,11 @@ const incrementUsage = async (messageText: string) => {
 
   const handleSendMessage = async () => {
     if (!requireAuth()) return;
+    // Unlock AudioContext inside user gesture — MUST await so it's 'running' before any speakAudio call.
+    // TalkingHead's playAudio() has a 1-second timeout race; if still 'suspended', audio is silently dropped.
+    if (headRef.current?.audioCtx?.state === 'suspended') {
+      try { await headRef.current.audioCtx.resume(); } catch(e) { console.warn('[AudioCtx] resume failed:', e); }
+    }
   //   if (tokensUsed >= FREE_PLAN_LIMIT) {
   //   setShowLimitModal(true);
   //   return;
@@ -1332,18 +1762,18 @@ const incrementUsage = async (messageText: string) => {
         setSessions(prev => [newSession, ...prev]);
         const newPath = `${window.location.pathname}?session_id=${newId}`;
         window.history.replaceState(null, '', newPath);
-        await supabase.from('chat_sessions').insert({ session_id: newId, user_id: user.id, title: newTitle });
+        // await supabase.from('chat_sessions').insert({ session_id: newId, user_id: user.id, title: newTitle });
     }
 
     // --- SAVE USER MSG IMMEDIATELY ---
-    await supabase.from('chat_messages').insert({
-        session_id: targetSessionId,
-        role: 'user',
-        content: currentInput
-    });
+    // await supabase.from('chat_messages').insert({
+    //     session_id: targetSessionId,
+    //     role: 'user',
+    //     content: currentInput
+    // });
 
     try {
-      const response = await fetch('https://avatar-tutor-6uih.onrender.com/api/chat', { 
+      const response = await fetch(`${OUTLRN_BACKEND_URL}/api/chat`, { 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: currentInput, session_id: targetSessionId })
@@ -1367,11 +1797,12 @@ const incrementUsage = async (messageText: string) => {
 
       // --- SAVE ASSISTANT MSG & RECORDING ---
       if (recordingBufferRef.current.length > 0) {
-          const { data: savedInteraction } = await supabase.from('session_interactions').insert({
-              session_id: targetSessionId,
-              user_query: currentInput,
-              actions: recordingBufferRef.current
-          }).select('id').single();
+          // const { data: savedInteraction } = await supabase.from('session_interactions').insert({
+          //     session_id: targetSessionId,
+          //     user_query: currentInput,
+          //     actions: recordingBufferRef.current
+          // }).select('id').single();
+          const savedInteraction: any = null;
 
           if (savedInteraction) {
               // 1. Save msg to DB with link
@@ -1381,12 +1812,12 @@ const incrementUsage = async (messageText: string) => {
                 .map(a => (a as any).text)
                 .join(' ');
 
-              await supabase.from('chat_messages').insert({
-                  session_id: targetSessionId,
-                  role: 'assistant',
-                  content: fullText,
-                  interaction_id: savedInteraction.id
-              });
+              // await supabase.from('chat_messages').insert({
+              //     session_id: targetSessionId,
+              //     role: 'assistant',
+              //     content: fullText,
+              //     interaction_id: savedInteraction.id
+              // });
 
               // 2. Update UI
               setMessages(prev => {
@@ -1410,9 +1841,12 @@ const incrementUsage = async (messageText: string) => {
     }
   };
 
-  const handleTestSpeech = () => {
+  const handleTestSpeech = async () => {
     if (!requireAuth()) return;
-    if (isPlaying || avatarStatus !== "Online") return;
+    // Unlock AudioContext — MUST await so playAudio doesn't hit its 1s timeout race
+    if (headRef.current?.audioCtx?.state === 'suspended') {
+      try { await headRef.current.audioCtx.resume(); } catch(e) {}
+    }
     commandQueueRef.current.push({ type: 'SPEAK', text: "Audio check. Synchronization complete. Ready for input." });
     processQueue();
   };
@@ -1532,13 +1966,17 @@ const incrementUsage = async (messageText: string) => {
           <div className="flex items-center gap-3">
               <button 
                onClick={handleTestSpeech}
-               disabled={avatarStatus !== "Online" || isPlaying}
                className="px-2 py-1 bg-white/5 hover:bg-cyan-500/20 border border-white/10 rounded text-[10px] font-mono text-cyan-500 transition-colors disabled:opacity-30 disabled:cursor-not-allowed hover:border-cyan-500/50"
               >
                TEST_AUDIO
               </button>
             <button 
-              onClick={() => setIsTTSActive(!isTTSActive)} 
+              onClick={() => { 
+                if (!isTTSActive && headRef.current?.audioCtx?.state === 'suspended') {
+                  headRef.current.audioCtx.resume().catch(() => {});
+                }
+                setIsTTSActive(!isTTSActive); 
+              }} 
               className="p-2 hover:bg-white/5 rounded-full transition-colors group"
               title={isTTSActive ? "Mute Voice" : "Enable Voice"}
             >
@@ -1752,7 +2190,7 @@ const incrementUsage = async (messageText: string) => {
                             className="text-5xl font-light text-white tracking-tight leading-tight"
                           >
                             {currentConcept.title}
-                            <span className="text-cyan-500 block text-sm font-mono font-bold mt-4 tracking-[0.2em] uppercase opacity-70 flex items-center gap-2">
+                            <span className="text-cyan-500 text-sm font-mono font-bold mt-4 tracking-[0.2em] uppercase opacity-70 flex items-center gap-2">
                                <div className="w-8 h-[1px] bg-cyan-500"></div> Core Concept
                             </span>
                           </motion.h1>
@@ -1902,7 +2340,7 @@ const incrementUsage = async (messageText: string) => {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                onClick={() => !user && setShowAuthModal(true)}
+                onClick={() => !LOCAL_AUTH_BYPASS && !user && setShowAuthModal(true)}
                 disabled={isProcessing}
                 placeholder={!user ? "Sign in to chat..." : isProcessing ? "Processing Neural Input..." : isPlaying ? "System explaining..." : "Ask a follow-up question..."}
                 className="bg-transparent border-none outline-none text-sm text-white placeholder-gray-600 flex-1 h-10 font-light tracking-wide disabled:cursor-not-allowed"

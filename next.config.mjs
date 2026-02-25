@@ -1,4 +1,10 @@
 /** @type {import('next').NextConfig} */
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const talkingheadModules = path.resolve(__dirname, 'node_modules/@met4citizen/talkinghead/modules');
+
 const nextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
@@ -17,6 +23,16 @@ const nextConfig = {
         fullySpecified: false,
       },
     });
+
+    // Resolve TalkingHead lipsync dynamic imports
+    config.resolve.alias = {
+      ...config.resolve.alias,
+      './lipsync-en.mjs': path.join(talkingheadModules, 'lipsync-en.mjs'),
+      './lipsync-fi.mjs': path.join(talkingheadModules, 'lipsync-fi.mjs'),
+      './lipsync-lt.mjs': path.join(talkingheadModules, 'lipsync-lt.mjs'),
+      './lipsync-fr.mjs': path.join(talkingheadModules, 'lipsync-fr.mjs'),
+      './lipsync-de.mjs': path.join(talkingheadModules, 'lipsync-de.mjs'),
+    };
 
     // Exclude problematic packages from server-side builds
     if (!isServer) {

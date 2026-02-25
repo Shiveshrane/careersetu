@@ -6,11 +6,12 @@ import { Navbar } from "../../components/home-page/navbar"
 import { GlobalStyles } from "../../components/home-page/global-styles"
 import { Aurora } from "../../components/home-page/aurora"
 import { useRouter } from "next/navigation"
-import { createClient } from '@supabase/supabase-js'
+// import { createClient } from '@supabase/supabase-js'
+import { supabase } from '@/lib/supabase'
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || ''
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
-const supabase = createClient(supabaseUrl, supabaseAnonKey)
+// const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || ''
+// const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
+// const supabase = createClient(supabaseUrl, supabaseAnonKey)
 
 interface Plan {
   id: string

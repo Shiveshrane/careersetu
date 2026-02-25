@@ -1,7 +1,7 @@
 'use client'
 import React, { useEffect, useRef, useState } from 'react';
 // Adjust these imports to match your actual folder structure
-import { TalkingHead } from "@/lib/modules/talkinghead.mjs"; 
+import { TalkingHead } from "@met4citizen/talkinghead"; 
 import { KokoroAdapter } from "@/lib/modules/KokoroAdapter"; 
 import './TalkingHead.css'; 
 

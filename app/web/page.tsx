@@ -5,7 +5,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence, LayoutGroup, Variants } from 'framer-motion';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { createClient } from '@supabase/supabase-js'; 
+// import { createClient } from '@supabase/supabase-js'; 
 import { useRouter, useSearchParams } from 'next/navigation';
 import { 
   Mic, ChevronRight, Layout, Code2, Columns, Volume2, VolumeX, Eye, 
@@ -14,14 +14,14 @@ import {
 } from 'lucide-react';
 
 // --- External Modules ---
-import { TalkingHead } from "../../lib/modules/talkinghead.mjs"; 
+import { TalkingHead } from "@met4citizen/talkinghead"; 
 import { KokoroAdapter } from "../../lib/modules/KokoroAdapter.js"; 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)); }
 
-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL || '', process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '');
+// const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL || '', process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '');
 
 // --- TYPES ---
 type LayoutMode = 'CONCEPT_MODE' | 'SPLIT_MODE' | 'FOCUS_MODE' | 'VISUAL_MODE';
@@ -102,6 +102,7 @@ const ImmersiveLearningPlatform = () => {
   useEffect(() => {
     if (headRef.current) return;
     const initAvatar = async () => {
+      if (!avatarRef.current) return;
       try {
         const head = new TalkingHead(avatarRef.current, { 
           ttsEndpoint: "N/A", 

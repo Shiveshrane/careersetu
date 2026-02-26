@@ -51,7 +51,7 @@ const TalkingHeadComponent = () => {
         headRef.current = head;
 
         // 2. Setup Adapter
-        adapterRef.current = new KokoroAdapter("http://localhost:5000");
+        adapterRef.current = new KokoroAdapter(process.env.NEXT_PUBLIC_KOKORO_BACKEND_URL || "http://127.0.0.1:8001");
 
         // 3. Load Person
         await loadPerson("julia");

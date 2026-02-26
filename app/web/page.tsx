@@ -110,7 +110,7 @@ const ImmersiveLearningPlatform = () => {
           mixerGainSpeech: 2
         });
         headRef.current = head;
-        adapterRef.current = new KokoroAdapter("https://cloggy-oneirocritically-niki.ngrok-free.dev");
+        adapterRef.current = new KokoroAdapter(process.env.NEXT_PUBLIC_KOKORO_BACKEND_URL || "http://127.0.0.1:8001");
         
         await head.showAvatar({ url: "/avatars/david.glb", body: "F", avatarMood: "neutral" });
         head.start();

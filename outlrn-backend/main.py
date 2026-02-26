@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 
 import base64
 
@@ -7,6 +7,7 @@ import json
 import logging
 
 import os
+import re
 
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
@@ -28,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.responses import StreamingResponse
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from pydantic import BaseModel, field_validator
 
@@ -44,7 +45,7 @@ app = FastAPI(
 
     title="Outlrn Fast API",
 
-    description="Outlrn FastAPI application — audio-driven orchestration",
+    description="Outlrn FastAPI application â€” audio-driven orchestration",
 
     version="0.2.0",
 
@@ -74,6 +75,28 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or os.getenv("GROQ_BASE_URL")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.1")
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+JSON_MAX_TOKENS = int(os.getenv("JSON_MAX_TOKENS", "2800"))
+SESSION_HISTORY_LIMIT = int(os.getenv("SESSION_HISTORY_LIMIT", "300"))
+SESSION_MEMORY: Dict[str, List[dict]] = {}
+
+
+def _safe_dump(value: Any, limit: int = 1200) -> str:
+
+    """Best-effort compact JSON logging with truncation."""
+
+    try:
+
+        text = json.dumps(value, ensure_ascii=False)
+
+    except Exception:
+
+        text = str(value)
+
+    if len(text) > limit:
+
+        return text[:limit] + "...<truncated>"
+
+    return text
 
 
 
@@ -95,7 +118,7 @@ def get_openai_client() -> AsyncOpenAI:
 
 # ---------------------------------------------------------------------------
 
-# Pydantic Models — action-based orchestrator contract
+# Pydantic Models â€” action-based orchestrator contract
 
 # ---------------------------------------------------------------------------
 
@@ -119,13 +142,13 @@ class OrchestratorAction(BaseModel):
 
 
 
-    # NARRATE — text the voice agent will speak
+    # NARRATE â€” text the voice agent will speak
 
     script: Optional[str] = None
 
 
 
-    # SHOW_CONTENT — brief content card
+    # SHOW_CONTENT â€” brief content card
 
     content_title: Optional[str] = None
 
@@ -133,7 +156,7 @@ class OrchestratorAction(BaseModel):
 
 
 
-    # SHOW_VISUAL — static visual (diagram / sandbox)
+    # SHOW_VISUAL â€” static visual (diagram / sandbox)
 
     visual_type: Optional[Literal["MERMAID", "BROWSER"]] = None
 
@@ -141,7 +164,7 @@ class OrchestratorAction(BaseModel):
 
 
 
-    # ANIMATE — step-by-step frame animation
+    # ANIMATE â€” step-by-step frame animation
 
     animation_type: Optional[str] = None  # e.g. "array_walk", "tree_traverse"
 
@@ -155,7 +178,7 @@ class OrchestratorAction(BaseModel):
 
 
 
-    # EXPLAIN_CODE — walk through code with synced line highlights
+    # EXPLAIN_CODE â€” walk through code with synced line highlights
 
     code_language: Optional[str] = None       # e.g. "python", "javascript"
 
@@ -163,7 +186,7 @@ class OrchestratorAction(BaseModel):
 
 
 
-    # GRAPH_ANIMATE — graph theory visualization
+    # GRAPH_ANIMATE â€” graph theory visualization
 
     graph_type: Optional[str] = None      # e.g. "bfs", "dfs", "dijkstra", "tree"
 
@@ -203,9 +226,25 @@ You are "Mentor," a master educator on Outlrn. Your goal is to build deep mental
 
 IMPORTANT: Respond ONLY with a valid JSON object.
 
-ALL values in the JSON must be STRINGS (except for animation_spec and checkpoint_options).
+Use valid JSON types. Keep text fields as strings, and keep structured payload fields
+(`animation_spec`, `code_spec`, `graph_spec`, `checkpoint_options`) as proper JSON objects/arrays.
 
 Do NOT use arrays/lists for content_body; use a single string with \\n for newlines.
+
+## LESSON PLANNING (MANDATORY)
+
+- Think one move ahead: decide the next 2-3 teaching beats before emitting the immediate action.
+- Every beat must map to exactly one UI surface: concept card, code walkthrough, or visual animation.
+- Emit actions in the exact sequence the student should experience on screen.
+
+## PANEL ROUTING (MANDATORY)
+
+- Concepts and summaries -> NARRATE (+ card) or SHOW_CONTENT.
+- Code-first teaching -> EXPLAIN_CODE.
+- Array/list motion -> ANIMATE.
+- Trees/BST/AVL/traversals -> GRAPH_ANIMATE with tree-compatible graph_type values.
+- Diagrams/architecture relationships -> SHOW_VISUAL.
+- NEVER use SHOW_VISUAL(MERMAID) for tree or traversal teaching.
 
 
 
@@ -273,7 +312,7 @@ You are responsible for the lesson's pace. Do not rush to the end.
 
 - **CHECKPOINT:** Interactive pause. {"action":"CHECKPOINT","script":"...","checkpoint_title":"...","checkpoint_options":[{"label":"...","value":"..."}]}
 
-- **ANIMATE:** Step-by-step array/list logic. {"action":"ANIMATE","animation_type":"array","animation_spec":{"array":[...],"description":"..."}}
+- **ANIMATE:** Step-by-step array/list logic. {"action":"ANIMATE","animation_type":"array_walk","animation_spec":{"array":[...],"description":"..."}}
 
 - **EXPLAIN_CODE:** Line-by-line walkthrough. {"action":"EXPLAIN_CODE","code_language":"python","code_spec":{"description":"..."}}
 
@@ -308,6 +347,114 @@ def sse(data: dict) -> str:
 def b64(chunk: bytes) -> str:
 
     return base64.b64encode(chunk).decode("ascii")
+
+
+TREE_GRAPH_HINTS = (
+    "tree",
+    "bst",
+    "avl",
+    "binary_tree",
+    "inorder",
+    "preorder",
+    "postorder",
+    "level_order",
+)
+
+
+def _infer_animation_component(animation_type: str, spec: Optional[dict] = None) -> str:
+    kind = (animation_type or "").strip().lower()
+    if any(token in kind for token in TREE_GRAPH_HINTS):
+        return "TREE"
+    if isinstance(spec, dict) and any(key in spec for key in ("nodes", "root", "tree")):
+        return "TREE"
+    return "ARRAY"
+
+
+def _infer_graph_component(graph_type: str) -> str:
+    kind = (graph_type or "").strip().lower()
+    if any(token in kind for token in TREE_GRAPH_HINTS):
+        return "TREE"
+    return "NETWORK"
+
+
+def _is_graph_animation_preferred(text: str) -> bool:
+
+    t = (text or "").lower()
+
+    graph_terms = (
+        "traversal",
+        "bfs",
+        "dfs",
+        "dijkstra",
+        "shortest path",
+        "connected component",
+        "topological",
+        "graph",
+    )
+    tree_terms = (
+        "tree",
+        "binary tree",
+        "bst",
+        "avl",
+        "inorder",
+        "preorder",
+        "postorder",
+        "level order",
+    )
+
+    return any(term in t for term in graph_terms) or any(term in t for term in tree_terms)
+
+
+def _infer_graph_type_from_text(text: str) -> str:
+
+    t = (text or "").lower()
+
+    if "inorder" in t:
+        return "inorder"
+    if "preorder" in t:
+        return "preorder"
+    if "postorder" in t:
+        return "postorder"
+    if "level order" in t or "level-order" in t:
+        return "level_order"
+    if "bst" in t:
+        return "bst"
+    if "avl" in t:
+        return "avl"
+    if "dijkstra" in t or "shortest path" in t:
+        return "dijkstra"
+    if "dfs" in t:
+        return "dfs"
+    if "bfs" in t:
+        return "bfs"
+    if "tree" in t:
+        return "tree"
+    return "bfs"
+
+
+def _normalize_orchestrator_action(action: OrchestratorAction) -> OrchestratorAction:
+
+    if action.action != "SHOW_VISUAL":
+        return action
+
+    visual_type = (action.visual_type or "").upper()
+    visual_spec = str(action.visual_spec or "")
+    combined = f"{visual_type} {visual_spec}"
+
+    if visual_type == "MERMAID" and _is_graph_animation_preferred(combined):
+        inferred_graph_type = _infer_graph_type_from_text(combined)
+        logger.warning(
+            "[ORCHESTRATOR][ACTION_FIX] forcing GRAPH_ANIMATE graph_type=%s from SHOW_VISUAL spec=%s",
+            inferred_graph_type,
+            _safe_dump(visual_spec, 400),
+        )
+        return OrchestratorAction(
+            action="GRAPH_ANIMATE",
+            graph_type=inferred_graph_type,
+            graph_spec={"description": visual_spec},
+        )
+
+    return action
 
 
 
@@ -354,10 +501,899 @@ def ensure_string_content(messages: List[dict]) -> List[dict]:
     return safe_history
 
 
+def _trim_history_in_place(history: List[dict], limit: int = SESSION_HISTORY_LIMIT) -> None:
+
+    if limit <= 1 or len(history) <= limit:
+        return
+
+    if history and history[0].get("role") == "system":
+        keep_tail = max(limit - 1, 0)
+        tail = history[-keep_tail:] if keep_tail > 0 else []
+        history[:] = [history[0], *tail]
+        return
+
+    history[:] = history[-limit:]
+
+
+def _append_history_message(history: List[dict], role: str, content: Any) -> None:
+    """Append one history message and enforce the in-memory session limit."""
+    if isinstance(content, (dict, list)):
+        text = json.dumps(content, ensure_ascii=False)
+    else:
+        text = str(content or "")
+
+    text = text.strip()
+    if not text:
+        return
+
+    history.append({"role": role, "content": text})
+    _trim_history_in_place(history)
+
+
+def _spoken_digest(lines: List[str], max_lines: int = 8, max_chars: int = 1600) -> str:
+    """Compact spoken lines so follow-up turns remember what was said without prompt bloat."""
+    cleaned = [str(line).strip() for line in lines if str(line).strip()]
+    if not cleaned:
+        return ""
+
+    if len(cleaned) > max_lines:
+        omitted = len(cleaned) - max_lines
+        cleaned = cleaned[:max_lines] + [f"... ({omitted} additional spoken steps omitted)"]
+
+    merged = " ".join(cleaned)
+    if len(merged) > max_chars:
+        merged = merged[: max_chars - 3].rstrip() + "..."
+
+    return merged
+
+
 
 # ---------------------------------------------------------------------------
 
-# get_next_action — ask the orchestrator LLM for its next move
+# Animation array recovery helpers
+
+# ---------------------------------------------------------------------------
+
+def _to_number(token: str) -> Optional[Union[int, float]]:
+
+    token = token.strip()
+
+    if re.fullmatch(r"-?\d+", token):
+
+        return int(token)
+
+    if re.fullmatch(r"-?\d*\.\d+", token):
+
+        return float(token)
+
+    return None
+
+
+
+def _extract_numeric_array_from_text(text: str) -> Optional[List[Union[int, float]]]:
+
+    if not text:
+
+        return None
+
+    # Prefer bracketed lists: [1, 2, 3]
+    for match in re.finditer(r"\[([^\[\]]+)\]", text):
+
+        chunk = match.group(1)
+
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", chunk)
+
+        parsed = [_to_number(n) for n in numbers]
+
+        values = [v for v in parsed if v is not None]
+
+        if len(values) >= 2:
+
+            return values
+
+    # Fallback: comma-separated sequence outside brackets: 1, 2, 3
+    for match in re.finditer(r"-?\d+(?:\.\d+)?(?:\s*,\s*-?\d+(?:\.\d+)?)+", text):
+
+        chunk = match.group(0)
+
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", chunk)
+
+        parsed = [_to_number(n) for n in numbers]
+
+        values = [v for v in parsed if v is not None]
+
+        if len(values) >= 2:
+
+            return values
+
+    # Fallback: whitespace-separated sequence outside brackets: "2 7 9 15 20 24 18"
+    # Require >=3 values so we don't accidentally capture tiny numeric fragments.
+    for match in re.finditer(r"-?\d+(?:\.\d+)?(?:\s+-?\d+(?:\.\d+)?){2,}", text):
+
+        chunk = match.group(0)
+
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", chunk)
+
+        parsed = [_to_number(n) for n in numbers]
+
+        values = [v for v in parsed if v is not None]
+
+        if len(values) >= 3:
+
+            return values
+
+    return None
+
+
+
+def _coerce_numeric_array(value: Any) -> Optional[List[Union[int, float]]]:
+
+    if not isinstance(value, list):
+
+        return None
+
+    out: List[Union[int, float]] = []
+
+    for item in value:
+
+        if isinstance(item, bool):
+
+            return None
+
+        if isinstance(item, (int, float)):
+
+            out.append(item)
+
+            continue
+
+        if isinstance(item, str):
+
+            n = _to_number(item)
+
+            if n is None:
+
+                return None
+
+            out.append(n)
+
+            continue
+
+        return None
+
+    return out
+
+
+
+def _looks_collapsed_singleton_array(value: Any) -> bool:
+
+    arr = _coerce_numeric_array(value)
+
+    if not arr or len(arr) != 1:
+
+        return False
+
+    one = arr[0]
+
+    if isinstance(one, float) and one.is_integer():
+
+        one = int(one)
+
+    if isinstance(one, int):
+
+        return abs(one) >= 100000
+
+    return False
+
+
+
+def _number_token(value: Union[int, float]) -> str:
+
+    if isinstance(value, float) and value.is_integer():
+
+        return str(int(value))
+
+    return str(value)
+
+
+def _decode_collapsed_array_with_reference(
+    value: Any, reference: Optional[List[Union[int, float]]]
+) -> Optional[List[Union[int, float]]]:
+
+    arr = _coerce_numeric_array(value)
+
+    if not arr or len(arr) != 1:
+
+        return None
+
+    if not reference or len(reference) < 2:
+
+        return None
+
+    source = arr[0]
+
+    if isinstance(source, float) and source.is_integer():
+
+        source = int(source)
+
+    text = str(source).strip()
+
+    if not text:
+
+        return None
+
+    token_values: Dict[str, Union[int, float]] = {}
+    token_counts: Dict[str, int] = {}
+
+    for n in reference:
+
+        token = _number_token(n)
+        token_values[token] = n
+        token_counts[token] = token_counts.get(token, 0) + 1
+
+    tokens = sorted(token_counts.keys(), key=len, reverse=True)
+    initial_state = tuple(token_counts[t] for t in tokens)
+
+    from functools import lru_cache
+
+    @lru_cache(maxsize=4096)
+    def _solve(pos: int, state: tuple[int, ...]) -> Optional[tuple[str, ...]]:
+
+        if pos == len(text):
+
+            return tuple() if sum(state) == 0 else None
+
+        if sum(state) == 0:
+
+            return None
+
+        for idx, token in enumerate(tokens):
+
+            remaining = state[idx]
+
+            if remaining <= 0:
+
+                continue
+
+            if not text.startswith(token, pos):
+
+                continue
+
+            next_state = list(state)
+            next_state[idx] -= 1
+            suffix = _solve(pos + len(token), tuple(next_state))
+
+            if suffix is not None:
+
+                return (token,) + suffix
+
+        return None
+
+    resolved = _solve(0, initial_state)
+
+    if not resolved or len(resolved) != len(reference):
+
+        return None
+
+    return [token_values[t] for t in resolved]
+
+
+def _recover_collapsed_frame_array(
+    value: Any,
+    prev_array: Optional[List[Union[int, float]]],
+    base_array: Optional[List[Union[int, float]]],
+) -> Optional[List[Union[int, float]]]:
+
+    for ref in (prev_array, base_array):
+
+        recovered = _decode_collapsed_array_with_reference(value, ref)
+
+        if recovered:
+
+            return recovered
+
+    arr = _coerce_numeric_array(value)
+
+    if not arr or len(arr) != 1:
+
+        return None
+
+    one = arr[0]
+
+    if isinstance(one, float) and one.is_integer():
+
+        one = int(one)
+
+    if not isinstance(one, int) or one < 0:
+
+        return None
+
+    text = str(one)
+    expected = len(prev_array or base_array or [])
+
+    if expected >= 2 and len(text) == expected and text.isdigit():
+
+        return [int(ch) for ch in text]
+
+    return None
+
+
+def _decode_compact_indices(value: Any, size: int) -> List[int]:
+
+    if size <= 0:
+
+        return []
+
+    parts: List[str] = []
+
+    if isinstance(value, int):
+
+        if value < 0:
+
+            return []
+
+        parts = list(str(value))
+
+    elif isinstance(value, str):
+
+        text = value.strip()
+
+        if not text.isdigit():
+
+            return []
+
+        parts = list(text)
+
+    else:
+
+        return []
+
+    out: List[int] = []
+
+    for part in parts:
+
+        idx = _coerce_index(part, size)
+
+        if idx is not None and idx not in out:
+
+            out.append(idx)
+
+    return out
+
+
+def _is_swap_completion_label(label: str) -> bool:
+
+    text = (label or "").strip().lower()
+
+    if not text:
+
+        return False
+
+    if "no swap" in text or "do not swap" in text or "don't swap" in text:
+
+        return False
+
+    if "should we swap" in text and "swapped" not in text and "swap done" not in text:
+
+        return False
+
+    if "swap?" in text and "swapped" not in text:
+
+        return False
+
+    if "?" in text and "swapped" not in text and "exchang" not in text:
+
+        return False
+
+    return ("swapped" in text) or ("swap" in text) or ("exchang" in text)
+
+
+def _pick_swap_indices(
+    pointers: Dict[str, int], highlights: List[int], size: int
+) -> Optional[tuple[int, int]]:
+
+    idxs = [i for i in highlights if _coerce_index(i, size) is not None]
+
+    if len(idxs) >= 2:
+
+        a, b = idxs[0], idxs[1]
+
+        if a != b:
+
+            return (a, b)
+
+    pointer_values = [v for v in pointers.values() if _coerce_index(v, size) is not None]
+    unique_pointer_values: List[int] = []
+
+    for v in pointer_values:
+
+        if v not in unique_pointer_values:
+
+            unique_pointer_values.append(v)
+
+    if len(unique_pointer_values) >= 2:
+
+        a, b = unique_pointer_values[0], unique_pointer_values[1]
+
+        if a != b:
+
+            return (a, b)
+
+    return None
+
+
+def _requires_multi_element_array(animation_type: Optional[str], description: str) -> bool:
+
+    kind = (animation_type or "").lower()
+
+    text = (description or "").lower()
+
+    signals = (
+        "array",
+        "walk",
+        "sort",
+        "search",
+        "swap",
+        "pointer",
+        "bubble",
+        "selection",
+        "insertion",
+        "merge",
+        "quick",
+        "partition",
+        "binary",
+    )
+
+    return any(sig in kind for sig in signals) or any(sig in text for sig in signals)
+
+
+def _is_internal_backend_feedback(text: str) -> bool:
+
+    if "What is your next action?" not in text:
+
+        return False
+
+    prefixes = (
+        "Narration delivered to student",
+        "Content card '",
+        "Visual generated and shown to student.",
+        "Animation complete (",
+        "Code explanation complete (",
+        "Graph animation complete (",
+        "That action was not understood.",
+    )
+
+    return any(text.startswith(prefix) for prefix in prefixes)
+
+
+
+def _latest_real_user_message(messages: List[dict]) -> Optional[str]:
+
+    for msg in reversed(messages):
+
+        if msg.get("role") != "user":
+
+            continue
+
+        content = str(msg.get("content", "") or "").strip()
+
+        if not content:
+
+            continue
+
+        if _is_internal_backend_feedback(content):
+
+            continue
+
+        return content
+
+    return None
+
+
+
+def _resolve_animation_array(
+    animation_spec: Dict[str, Any], messages: List[dict], animation_type: Optional[str] = None
+) -> tuple[Optional[List[Union[int, float]]], Optional[str]]:
+
+    current = _coerce_numeric_array(animation_spec.get("array"))
+    description = str(animation_spec.get("description", "") or "")
+    requires_multi = _requires_multi_element_array(animation_type, description)
+
+    # Keep clearly-valid arrays as-is
+    if current:
+        if len(current) >= 2:
+            return current, None
+
+        if len(current) == 1 and not requires_multi and not _looks_collapsed_singleton_array(current):
+            return current, None
+
+    user_text = _latest_real_user_message(messages)
+
+    if user_text:
+
+        from_user = _extract_numeric_array_from_text(user_text)
+
+        if from_user:
+
+            return from_user, "latest_user_prompt"
+
+    from_description = _extract_numeric_array_from_text(description)
+
+    if from_description:
+
+        return from_description, "description"
+
+    # Final fallback: if the model produced an obviously collapsed singleton
+    # and we cannot recover an explicit list, use a sane template array.
+    if _looks_collapsed_singleton_array(current) or not current or (
+        requires_multi and current is not None and len(current) < 2
+    ):
+
+        description_lc = description.lower()
+
+        if "binary" in description_lc and "search" in description_lc:
+
+            return [1, 3, 5, 7, 9, 11, 13], "default_template_binary_search"
+
+        if "search" in description_lc:
+
+            return [5, 12, 7, 39, 15, 8], "default_template_search"
+
+        if "sort" in description_lc:
+
+            return [5, 3, 8, 1, 2, 7], "default_template_sort"
+
+        return [4, 1, 7, 3, 9], "default_template_generic"
+
+    return current, None
+
+
+def _coerce_index(value: Any, size: int) -> Optional[int]:
+
+    if size <= 0:
+        return None
+
+    if isinstance(value, bool) or value is None:
+        return None
+
+    parsed: Optional[int] = None
+
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        parsed = int(value) if value.is_integer() else None
+    elif isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"-?\d+", text):
+            parsed = int(text)
+
+    if parsed is None:
+        return None
+
+    if parsed < 0 or parsed >= size:
+        return None
+
+    return parsed
+
+
+def _normalize_active_range(value: Any, size: int, pointers: Dict[str, int]) -> Optional[List[int]]:
+
+    if size <= 0:
+        return None
+
+    if isinstance(value, list):
+        if len(value) >= 2:
+            a = _coerce_index(value[0], size)
+            b = _coerce_index(value[1], size)
+            if a is not None and b is not None:
+                lo, hi = sorted((a, b))
+                return [lo, hi]
+        elif len(value) == 1:
+            value = value[0]
+        else:
+            value = None
+
+    if isinstance(value, str):
+        digits = re.findall(r"\d", value)
+        if len(digits) >= 2:
+            a = _coerce_index(int(digits[0]), size)
+            b = _coerce_index(int(digits[-1]), size)
+            if a is not None and b is not None:
+                lo, hi = sorted((a, b))
+                return [lo, hi]
+        one = _coerce_index(value, size)
+        if one is not None:
+            return [one, one]
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        n = int(value)
+        if n >= 10:
+            digits = re.findall(r"\d", str(abs(n)))
+            if len(digits) >= 2:
+                a = _coerce_index(int(digits[0]), size)
+                b = _coerce_index(int(digits[-1]), size)
+                if a is not None and b is not None:
+                    lo, hi = sorted((a, b))
+                    return [lo, hi]
+        one = _coerce_index(value, size)
+        if one is not None:
+            return [one, one]
+
+    l_ptr = pointers.get("L", pointers.get("left"))
+    r_ptr = pointers.get("R", pointers.get("right"))
+    if l_ptr is not None and r_ptr is not None:
+        lo, hi = sorted((l_ptr, r_ptr))
+        return [lo, hi]
+
+    return [0, size - 1] if size >= 2 else [0, 0]
+
+
+def _sanitize_array_frames(
+    frames: Any,
+    fallback_array: Optional[List[Union[int, float]]] = None,
+    requires_multi: bool = False,
+) -> List[dict]:
+
+    base = list(fallback_array or [])
+    raw_frames = frames if isinstance(frames, list) else []
+    safe_frames: List[dict] = []
+    prev_array = list(base)
+
+    for raw in raw_frames:
+        src = raw if isinstance(raw, dict) else {}
+        frame_array_raw = src.get("array")
+        frame_array = _coerce_numeric_array(frame_array_raw)
+        recovered_collapsed = _recover_collapsed_frame_array(
+            frame_array_raw,
+            prev_array if prev_array else None,
+            base if base else None,
+        )
+        use_frame_array = (
+            frame_array is not None
+            and len(frame_array) >= 1
+            and not _looks_collapsed_singleton_array(frame_array)
+            and not (requires_multi and len(frame_array) < 2)
+        )
+        used_model_array = False
+        if use_frame_array:
+            current_array = list(frame_array)
+            used_model_array = True
+        elif recovered_collapsed is not None:
+            current_array = list(recovered_collapsed)
+            used_model_array = True
+        elif prev_array:
+            current_array = list(prev_array)
+        else:
+            current_array = list(base)
+
+        size = len(current_array)
+
+        pointer_map: Dict[str, int] = {}
+        if isinstance(src.get("pointers"), dict):
+            for k, v in src["pointers"].items():
+                idx = _coerce_index(v, size)
+                if idx is not None:
+                    pointer_map[str(k)] = idx
+
+        if not pointer_map and size > 0:
+            pointer_map = {"i": 0}
+
+        highlights: List[int] = []
+        raw_highlights = src.get("highlights")
+        if isinstance(raw_highlights, list):
+            for item in raw_highlights:
+                idx = _coerce_index(item, size)
+                item_text = item.strip() if isinstance(item, str) else ""
+                should_expand_compact = False
+                if idx is None:
+                    should_expand_compact = True
+                elif (
+                    isinstance(item, str)
+                    and len(item_text) >= 2
+                    and item_text.isdigit()
+                    and item_text.startswith("0")
+                ):
+                    should_expand_compact = True
+
+                if should_expand_compact:
+                    for compact_idx in _decode_compact_indices(item, size):
+                        if compact_idx not in highlights:
+                            highlights.append(compact_idx)
+                    continue
+
+                if idx is not None and idx not in highlights:
+                    highlights.append(idx)
+
+        if not highlights:
+            for _, idx in pointer_map.items():
+                if idx not in highlights:
+                    highlights.append(idx)
+
+        if not highlights and size > 0:
+            highlights = [0]
+
+        active_range = _normalize_active_range(src.get("activeRange"), size, pointer_map)
+
+        label = str(src.get("label", "") or "").strip()
+        if not label:
+            label = "Follow the highlighted indices for this step."
+
+        if (
+            not used_model_array
+            and prev_array
+            and len(prev_array) == size
+            and _is_swap_completion_label(label)
+        ):
+            swap_pair = _pick_swap_indices(pointer_map, highlights, size)
+            if swap_pair:
+                a, b = swap_pair
+                swapped = list(current_array)
+                swapped[a], swapped[b] = swapped[b], swapped[a]
+                current_array = swapped
+
+        sanitized = dict(src)
+        sanitized["array"] = current_array
+        sanitized["pointers"] = pointer_map
+        sanitized["highlights"] = highlights
+        sanitized["activeRange"] = active_range
+        sanitized["label"] = label
+
+        safe_frames.append(sanitized)
+        prev_array = current_array
+
+    if not safe_frames:
+        if base:
+            default_range = [0, len(base) - 1] if len(base) >= 2 else [0, 0]
+            return [
+                {
+                    "array": list(base),
+                    "pointers": {"i": 0},
+                    "highlights": [0],
+                    "activeRange": default_range,
+                    "label": "Start with the initial array state.",
+                }
+            ]
+        return []
+
+    return safe_frames
+
+
+def _deterministic_array_narration(
+    frame: dict, index: int, total: int, prev_frame: Optional[dict] = None
+) -> str:
+
+    arr = _coerce_numeric_array(frame.get("array")) or []
+    label = str(frame.get("label", "") or "").strip()
+    pointers = frame.get("pointers") if isinstance(frame.get("pointers"), dict) else {}
+    highlights = frame.get("highlights") if isinstance(frame.get("highlights"), list) else []
+    active_range = (
+        frame.get("activeRange")
+        if isinstance(frame.get("activeRange"), list) and len(frame.get("activeRange")) >= 2
+        else None
+    )
+
+    prev_arr = _coerce_numeric_array(prev_frame.get("array")) if isinstance(prev_frame, dict) else None
+    prev_label = str(prev_frame.get("label", "") or "").strip() if isinstance(prev_frame, dict) else ""
+    prev_pointers = (
+        prev_frame.get("pointers") if isinstance(prev_frame, dict) and isinstance(prev_frame.get("pointers"), dict) else {}
+    )
+    prev_highlights = (
+        prev_frame.get("highlights") if isinstance(prev_frame, dict) and isinstance(prev_frame.get("highlights"), list) else []
+    )
+    prev_active_range = (
+        prev_frame.get("activeRange")
+        if isinstance(prev_frame, dict)
+        and isinstance(prev_frame.get("activeRange"), list)
+        and len(prev_frame.get("activeRange")) >= 2
+        else None
+    )
+
+    def _label_is_consistent(text: str) -> bool:
+        if not text:
+            return True
+
+        for m in re.finditer(r"index\s+(\d+)", text.lower()):
+            idx = _coerce_index(m.group(1), len(arr))
+            if idx is None:
+                return False
+
+        checks: List[tuple[str, str]] = []
+        for m in re.finditer(
+            r"value\s+(-?\d+(?:\.\d+)?)\s+at\s+index\s+(\d+)",
+            text.lower(),
+        ):
+            checks.append((m.group(2), m.group(1)))
+        for m in re.finditer(
+            r"index\s+(\d+)[^\n\r\.]*?value\s+(-?\d+(?:\.\d+)?)",
+            text.lower(),
+        ):
+            checks.append((m.group(1), m.group(2)))
+
+        for idx_raw, val_raw in checks:
+            idx = _coerce_index(idx_raw, len(arr))
+            val = _to_number(val_raw)
+            if idx is None or val is None:
+                return False
+            if arr[idx] != val:
+                return False
+
+        return True
+
+    focus_bits: List[str] = []
+    for raw_idx in highlights[:2]:
+        idx = _coerce_index(raw_idx, len(arr))
+        if idx is None:
+            continue
+        focus_bits.append(f"index {idx} has value {arr[idx]}")
+
+    pointer_bits: List[str] = []
+    for key in sorted(pointers.keys()):
+        idx = _coerce_index(pointers.get(key), len(arr))
+        if idx is not None:
+            pointer_bits.append(f"{key}={idx}")
+
+    prev_focus_bits: List[str] = []
+    for raw_idx in prev_highlights[:2]:
+        idx = _coerce_index(raw_idx, len(prev_arr or []))
+        if idx is None or not prev_arr:
+            continue
+        prev_focus_bits.append(f"index {idx} has value {prev_arr[idx]}")
+
+    prev_pointer_bits: List[str] = []
+    for key in sorted(prev_pointers.keys()):
+        idx = _coerce_index(prev_pointers.get(key), len(prev_arr or arr))
+        if idx is not None:
+            prev_pointer_bits.append(f"{key}={idx}")
+
+    parts: List[str] = []
+    label_is_fresh = label and label.casefold() != prev_label.casefold()
+    if label and label_is_fresh and _label_is_consistent(label):
+        parts.append(label.rstrip("."))
+    if focus_bits and (index == 0 or focus_bits != prev_focus_bits):
+        parts.append("Focus: " + ", ".join(focus_bits))
+    if pointer_bits and (index == 0 or pointer_bits != prev_pointer_bits):
+        parts.append("Pointers: " + ", ".join(pointer_bits))
+
+    if active_range:
+        curr_l = _coerce_index(active_range[0], len(arr))
+        curr_r = _coerce_index(active_range[1], len(arr))
+        prev_l = _coerce_index(prev_active_range[0], len(arr)) if prev_active_range else None
+        prev_r = _coerce_index(prev_active_range[1], len(arr)) if prev_active_range else None
+        if curr_l is not None and curr_r is not None and (index == 0 or curr_l != prev_l or curr_r != prev_r):
+            parts.append(f"Search window is now [{curr_l}, {curr_r}]")
+
+    if prev_arr and arr and arr != prev_arr:
+        changed: List[str] = []
+        for i, (a, b) in enumerate(zip(prev_arr, arr)):
+            if a != b:
+                changed.append(f"index {i} -> {b}")
+            if len(changed) >= 2:
+                break
+        if changed:
+            parts.append("Array update: " + ", ".join(changed))
+
+    if not parts and index < total - 1:
+        parts.append("Proceeding to the next decision point")
+
+    if index == total - 1:
+        if "not found" in label.lower():
+            parts.append("This finishes the walkthrough with the target not found")
+        else:
+            parts.append("This completes this array walkthrough")
+
+    narration = ". ".join(p for p in parts if p).strip()
+    if not narration:
+        narration = f"Step {index + 1} of {total}."
+
+    if not narration.endswith("."):
+        narration += "."
+
+    return narration
+
+
+
+# ---------------------------------------------------------------------------
+
+# get_next_action â€” ask the orchestrator LLM for its next move
 
 # ---------------------------------------------------------------------------
 
@@ -379,7 +1415,7 @@ async def get_next_action(messages: List[dict], _retries: int = 3) -> Orchestrat
 
                 response_format={"type": "json_object"},
 
-                temperature=0.5,
+                temperature=0.2,
 
             )
 
@@ -411,7 +1447,7 @@ async def get_next_action(messages: List[dict], _retries: int = 3) -> Orchestrat
 
 # ---------------------------------------------------------------------------
 
-# WORKER — Voice (streaming TTS)
+# WORKER â€” Voice (streaming TTS)
 
 # ---------------------------------------------------------------------------
 
@@ -447,7 +1483,7 @@ async def voice_stream(script: str) -> AsyncIterator[bytes]:
 
 # ---------------------------------------------------------------------------
 
-# WORKER — Mermaid diagram
+# WORKER â€” Mermaid diagram
 
 # ---------------------------------------------------------------------------
 
@@ -490,6 +1526,7 @@ async def mermaid_worker(spec: str) -> dict:
         ],
 
         response_format={"type": "json_object"},
+        temperature=0,
 
     )
 
@@ -501,7 +1538,7 @@ async def mermaid_worker(spec: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
-# WORKER — Browser UI sandbox
+# WORKER â€” Browser UI sandbox
 
 # ---------------------------------------------------------------------------
 
@@ -544,6 +1581,7 @@ async def browser_ui_worker(spec: str) -> dict:
         ],
 
         response_format={"type": "json_object"},
+        temperature=0,
 
     )
 
@@ -555,7 +1593,7 @@ async def browser_ui_worker(spec: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
-# DISPATCHER — routes to the right visual worker
+# DISPATCHER â€” routes to the right visual worker
 
 # ---------------------------------------------------------------------------
 
@@ -577,7 +1615,7 @@ async def generate_visual(visual_type: str, spec: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
-# WORKER — Animation frame generator
+# WORKER â€” Animation frame generator
 
 # ---------------------------------------------------------------------------
 
@@ -593,11 +1631,11 @@ IMPORTANT: Respond ONLY with a valid JSON object containing a "frames" array.
 
 
 
-## MANDATORY FRAME FIELDS — every frame MUST include ALL of these:
+## MANDATORY FRAME FIELDS â€” every frame MUST include ALL of these:
 
 {
 
-  "array":       [<current state of the array — update after swaps/moves>],
+  "array":       [<current state of the array â€” update after swaps/moves>],
 
   "pointers":    {"<LabelName>": <index>, ...},
 
@@ -611,7 +1649,7 @@ IMPORTANT: Respond ONLY with a valid JSON object containing a "frames" array.
 
 
 
-## POINTERS ARE REQUIRED — never omit them.
+## POINTERS ARE REQUIRED â€” never omit them.
 
 `pointers` is an object mapping label names to array indices.
 
@@ -619,21 +1657,21 @@ Use descriptive labels that match the algorithm:
 
 
 
-  Binary search → {"L": 0, "M": 4, "R": 9}
+  Binary search â†’ {"L": 0, "M": 4, "R": 9}
 
-  Bubble sort   → {"i": 0, "j": 1}
+  Bubble sort   â†’ {"i": 0, "j": 1}
 
-  Quick sort    → {"pivot": 5, "i": 1, "j": 7}
+  Quick sort    â†’ {"pivot": 5, "i": 1, "j": 7}
 
-  Two pointers  → {"left": 0, "right": 9}
+  Two pointers  â†’ {"left": 0, "right": 9}
 
-  Insertion sort→ {"key": 3, "j": 2}
+  Insertion sortâ†’ {"key": 3, "j": 2}
 
-  Selection sort→ {"min": 2, "i": 4}
+  Selection sortâ†’ {"min": 2, "i": 4}
 
-  Linear search → {"i": 3}
+  Linear search â†’ {"i": 3}
 
-  Merge sort    → {"l": 0, "m": 3, "r": 7}
+  Merge sort    â†’ {"l": 0, "m": 3, "r": 7}
 
 
 
@@ -666,10 +1704,22 @@ Every frame MUST highlight at least one index.
 2. **Update the Array:** If the algorithm rearranges elements, `array` must reflect the new order in subsequent frames.
 
 3. **No Skipped Steps:** Every logical step gets a frame, even near the end.
+4. Keep output compact: generate 4-10 frames only.
+
+## Accuracy Hard Rules (non-negotiable):
+
+1. Every pointer and highlight index MUST be a valid integer index into `array`.
+2. `activeRange` MUST be either `null` or a two-integer list `[start, end]` (never strings, never compressed forms like `[46]` or `["06"]`).
+3. The `label` MUST match the frame data exactly. If you mention a value at an index, it must equal `array[index]`.
+4. Never collapse arrays into concatenated numbers like `[135791113]`. Keep explicit element lists.
+5. For binary search:
+   - Keep the array unchanged across frames.
+   - Use pointers `L`, `M`, `R`.
+   - `activeRange` should match the current search window `[L, R]`.
 
 
 
-## Concrete Example — Bubble Sort of [5, 3, 8, 1]:
+## Concrete Example â€” Bubble Sort of [5, 3, 8, 1]:
 
 
 
@@ -715,7 +1765,7 @@ You receive a description of code to generate (or existing code to explain). You
 
 1. If no code is provided, write clean, idiomatic code for the described concept.
 
-2. Break the code into logical segments — each segment is a contiguous range of lines that forms one conceptual unit.
+2. Break the code into logical segments â€” each segment is a contiguous range of lines that forms one conceptual unit.
 
 
 
@@ -731,9 +1781,9 @@ You receive a description of code to generate (or existing code to explain). You
 
   "segments": [
 
-    {"lines": [1, 3], "explanation": "Import statements and setup — we bring in the tools we need."},
+    {"lines": [1, 3], "explanation": "Import statements and setup â€” we bring in the tools we need."},
 
-    {"lines": [5, 12], "explanation": "The main function definition — this is where the core logic lives."},
+    {"lines": [5, 12], "explanation": "The main function definition â€” this is where the core logic lives."},
 
     ...
 
@@ -751,9 +1801,9 @@ You receive a description of code to generate (or existing code to explain). You
 
 - Segments should NOT overlap.
 
-- Each segment should cover 2–8 lines. Split large blocks; merge trivial one-liners with neighbors.
+- Each segment should cover 2â€“8 lines. Split large blocks; merge trivial one-liners with neighbors.
 
-- `explanation` should be a 1–2 sentence description of WHAT this segment does and WHY, written for a learner.
+- `explanation` should be a 1â€“2 sentence description of WHAT this segment does and WHY, written for a learner.
 
 - The code should be complete and runnable.
 
@@ -794,12 +1844,44 @@ async def generate_animation(animation_type: str, spec: dict) -> List[dict]:
         ],
 
         response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=JSON_MAX_TOKENS,
 
     )
 
-    raw = json.loads(response.choices[0].message.content)
+    raw_content = response.choices[0].message.content or "{}"
 
-    return raw.get("frames", [])
+    logger.warning(
+
+        "[ANIMATE][LLM_RAW] type=%s spec=%s response=%s",
+
+        animation_type,
+
+        _safe_dump(spec, 600),
+
+        _safe_dump(raw_content, 2400),
+
+    )
+
+    raw = json.loads(raw_content)
+
+    frames = raw.get("frames", [])
+
+    first_frame_array = frames[0].get("array") if frames else None
+
+    logger.warning(
+
+        "[ANIMATE][PARSED] frame_count=%s first_array_type=%s first_array=%s",
+
+        len(frames),
+
+        type(first_frame_array).__name__ if first_frame_array is not None else "None",
+
+        _safe_dump(first_frame_array, 600),
+
+    )
+
+    return frames
 
 
 
@@ -807,7 +1889,7 @@ async def generate_animation(animation_type: str, spec: dict) -> List[dict]:
 
 # ---------------------------------------------------------------------------
 
-# WORKER — Code explanation generator
+# WORKER â€” Code explanation generator
 
 # ---------------------------------------------------------------------------
 
@@ -840,6 +1922,8 @@ async def generate_code_explanation(code_language: str, spec: dict) -> dict:
         ],
 
         response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=JSON_MAX_TOKENS,
 
     )
 
@@ -863,7 +1947,7 @@ async def generate_code_explanation(code_language: str, spec: dict) -> dict:
 
 # ---------------------------------------------------------------------------
 
-# WORKER — Graph animation frame generator
+# WORKER â€” Graph animation frame generator
 
 # ---------------------------------------------------------------------------
 
@@ -935,7 +2019,7 @@ IMPORTANT: Respond ONLY with a valid JSON object containing a "graph" object and
 
 ## GRAPH OBJECT RULES:
 
-- `nodes`: Array of {id, label, x, y}. Positions are in a 400×300 normalized viewport.
+- `nodes`: Array of {id, label, x, y}. Positions are in a 400Ã—300 normalized viewport.
 
   - x ranges from 20 to 380, y ranges from 20 to 280.
 
@@ -951,23 +2035,36 @@ IMPORTANT: Respond ONLY with a valid JSON object containing a "graph" object and
 
 
 
-## FRAME FIELDS — every frame MUST include ALL of these:
+## FRAME FIELDS â€” every frame MUST include ALL of these:
 
 {
 
-  "visitedNodes": ["A", "B"],         // IDs of all nodes visited so far
+  "activeNodes": ["A", "B", "C"],
 
-  "activeNode": "C",                   // The node currently being processed (or null)
+  "activeNode": "C",
 
-  "visitedEdges": [["A","B"]],         // Edges already traversed (as [from, to] pairs)
+  "activeEdges": [["A","B"], ["B","C"]],
 
-  "activeEdge": ["B", "C"],            // The edge currently being traversed (or null)
+  "activeEdge": ["B", "C"],
 
-  "frontier": ["D", "E"],              // Current queue/stack/priority queue contents
+  "visitedNodes": ["A", "B", "C"],
+
+  "visitedEdges": [["A","B"], ["B","C"]],
+
+  "frontier": ["D", "E"],
 
   "label": "Dequeue B. Visit neighbor C, add it to the queue."
 
 }
+
+Notes:
+- activeNodes: nodes to visually highlight this frame.
+- activeNode: the node currently being processed (or null).
+- activeEdges: edges to visually highlight this frame.
+- activeEdge: currently traversed edge (or null).
+- visitedNodes: IDs of all nodes visited so far.
+- visitedEdges: traversed edges as [from, to] pairs.
+- frontier: current queue/stack/priority queue contents.
 
 
 
@@ -984,16 +2081,17 @@ IMPORTANT: Respond ONLY with a valid JSON object containing a "graph" object and
 5. **Cumulative Progress:** visitedNodes and visitedEdges grow monotonically. Never remove a visited node/edge.
 
 6. **Final Frame:** All reachable nodes are visited, frontier is empty. Label: "All nodes visited! Traversal complete."
+7. Keep output compact: generate 5-12 frames only.
 
 
 
 ## Graph Design Tips:
 
-- For BFS/DFS demos: Use 6–10 nodes. Create a graph with enough branching to make the algorithm interesting.
+- For BFS/DFS demos: Use 6â€“10 nodes. Create a graph with enough branching to make the algorithm interesting.
 
-- For tree traversals: Use a balanced or slightly unbalanced tree with 7–15 nodes.
+- For tree traversals: Use a balanced or slightly unbalanced tree with 7â€“15 nodes.
 
-- For Dijkstra: Add "weight" field to edges, use 5–8 nodes.
+- For Dijkstra: Add "weight" field to edges, use 5â€“8 nodes.
 
 - Keep graphs simple enough to teach clearly but complex enough to show the algorithm's behavior.
 
@@ -1030,6 +2128,8 @@ async def generate_graph_animation(graph_type: str, spec: dict) -> dict:
         ],
 
         response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=JSON_MAX_TOKENS,
 
     )
 
@@ -1049,7 +2149,7 @@ async def generate_graph_animation(graph_type: str, spec: dict) -> dict:
 
 # ---------------------------------------------------------------------------
 
-# Graph frame narrator — generates a short narration for a single graph frame
+# Graph frame narrator â€” generates a short narration for a single graph frame
 
 # ---------------------------------------------------------------------------
 
@@ -1091,29 +2191,29 @@ Frame {index} of {total} total frames.
 
 
 
-## PACING — this is critical for learning:
+## PACING â€” this is critical for learning:
 
 
 
-**Frames 0–2 (Teaching Phase):**
+**Frames 0â€“2 (Teaching Phase):**
 
   Explain the mechanic deeply. Walk through the logic like the student has never seen it.
 
-  - "We start at node A. In BFS, we use a queue — first in, first out. So we add A to our queue and mark it as visited."
+  - "We start at node A. In BFS, we use a queue â€” first in, first out. So we add A to our queue and mark it as visited."
 
   - "Now we dequeue A and look at its neighbors: B and C. We add both to the queue."
 
-  - 3–4 sentences. Name the nodes, explain the data structure, explain WHY.
+  - 3â€“4 sentences. Name the nodes, explain the data structure, explain WHY.
 
 
 
-**Frames 3–5 (Reinforcement Phase):**
+**Frames 3â€“5 (Reinforcement Phase):**
 
   The student now knows the rule. Narrate the action but skip re-explaining the full mechanic.
 
   - "Dequeue B, visit its neighbors D and E. Add them to the queue."
 
-  - 1–2 sentences. Reference the established pattern.
+  - 1â€“2 sentences. Reference the established pattern.
 
 
 
@@ -1121,7 +2221,7 @@ Frame {index} of {total} total frames.
 
   The student has internalized the pattern. Use very short cues.
 
-  - "Visit D." / "Nothing new from E." / "Queue is empty — done!"
+  - "Visit D." / "Nothing new from E." / "Queue is empty â€” done!"
 
   - 1 sentence max, often just a few words.
 
@@ -1129,13 +2229,13 @@ Frame {index} of {total} total frames.
 
 ## Rules:
 
-- Reference specific NODE NAMES (A, B, C...) — not generic "the current node."
+- Reference specific NODE NAMES (A, B, C...) â€” not generic "the current node."
 
 - Mention the frontier state (queue/stack contents) in early frames.
 
 - Do NOT repeat what the on-screen label already says. Add insight, not echo.
 
-- On the final frame, give a satisfying conclusion: "And that's our BFS complete — we visited every reachable node, layer by layer."
+- On the final frame, give a satisfying conclusion: "And that's our BFS complete â€” we visited every reachable node, layer by layer."
 
 
 
@@ -1181,7 +2281,7 @@ NARRATE FRAME INDEX: {index}
 
 # ---------------------------------------------------------------------------
 
-# Frame narrator — generates a short narration for a single animation frame
+# Frame narrator â€” generates a short narration for a single animation frame
 
 # ---------------------------------------------------------------------------
 
@@ -1205,7 +2305,7 @@ async def narrate_frame(
 
     what is happening now, and what comes next.  This lets it produce
 
-    context-aware narration like "We're almost done — the pointer just
+    context-aware narration like "We're almost done â€” the pointer just
 
     landed on our target" instead of a generic "The pointer moved."
 
@@ -1233,27 +2333,27 @@ Frame {index} of {total} total frames.
 
 
 
-## PACING — this is critical for learning:
+## PACING â€” this is critical for learning:
 
 
 
-**Frames 0–2 (Teaching Phase):**
+**Frames 0â€“2 (Teaching Phase):**
 
   Explain the mechanic deeply. Walk through the logic like the student has never seen it.
 
   - "Look at where our pointers are. We're comparing the value at index 0, which is 5, with the value at index 1, which is 3. Since 5 is greater than 3, the rule says we need to swap them."
 
-  - 3–4 sentences. Name the values, name the indices, explain WHY.
+  - 3â€“4 sentences. Name the values, name the indices, explain WHY.
 
 
 
-**Frames 3–5 (Reinforcement Phase):**
+**Frames 3â€“5 (Reinforcement Phase):**
 
   The student now knows the rule. Narrate the action but skip re-explaining the full mechanic.
 
-  - "Comparing these two — 8 is bigger, so swap."
+  - "Comparing these two â€” 8 is bigger, so swap."
 
-  - 1–2 sentences. Reference the established pattern.
+  - 1â€“2 sentences. Reference the established pattern.
 
 
 
@@ -1271,11 +2371,11 @@ Frame {index} of {total} total frames.
 
 - Do NOT repeat what the on-screen label already says. Add insight, not echo.
 
-- If the frame shows a swap ABOUT to happen, build anticipation: "These two are out of order — watch what happens."
+- If the frame shows a swap ABOUT to happen, build anticipation: "These two are out of order â€” watch what happens."
 
 - If the frame shows AFTER a swap, confirm it: "There we go, now that's in place."
 
-- On the final frame, give a satisfying conclusion: "And we're done — the array is fully sorted."
+- On the final frame, give a satisfying conclusion: "And we're done â€” the array is fully sorted."
 
 
 
@@ -1315,7 +2415,7 @@ NARRATE FRAME INDEX: {index}
 
 # ---------------------------------------------------------------------------
 
-# Code segment narrator — narrates a single code segment
+# Code segment narrator â€” narrates a single code segment
 
 # ---------------------------------------------------------------------------
 
@@ -1363,11 +2463,11 @@ Segment {index + 1} of {total} total segments.
 
 
 
-## PACING — adapt depth based on position:
+## PACING â€” adapt depth based on position:
 
 
 
-**Segments 1–2 (Teaching Phase):**
+**Segments 1â€“2 (Teaching Phase):**
 
   Explain the code deeply. Walk through each line's purpose like the student is new to this.
 
@@ -1375,17 +2475,17 @@ Segment {index + 1} of {total} total segments.
 
   - Explain WHY this code exists, not just what it does.
 
-  - 3–4 sentences.
+  - 3â€“4 sentences.
 
 
 
-**Segments 3–4 (Reinforcement Phase):**
+**Segments 3â€“4 (Reinforcement Phase):**
 
   The student now has context. Explain the logic but skip re-explaining established patterns.
 
-  - "Here we handle the edge case…" / "This loop does the heavy lifting…"
+  - "Here we handle the edge caseâ€¦" / "This loop does the heavy liftingâ€¦"
 
-  - 1–2 sentences.
+  - 1â€“2 sentences.
 
 
 
@@ -1403,9 +2503,9 @@ Segment {index + 1} of {total} total segments.
 
 - Reference the ACTUAL code on the highlighted lines. Quote variable names and values.
 
-- Do NOT just restate the segment explanation — add teaching insight.
+- Do NOT just restate the segment explanation â€” add teaching insight.
 
-- If this is the first segment, set the stage: "Let's start at the top…"
+- If this is the first segment, set the stage: "Let's start at the topâ€¦"
 
 - If this is the last segment, give a satisfying wrap-up.
 
@@ -1457,7 +2557,7 @@ NARRATE SEGMENT INDEX: {index} (lines {segments[index].get("lines", [])})
 
 # ---------------------------------------------------------------------------
 
-# THE ORCHESTRATOR — multi-turn async generator
+# THE ORCHESTRATOR â€” multi-turn async generator
 
 # ---------------------------------------------------------------------------
 
@@ -1467,33 +2567,74 @@ MAX_TURNS = 30  # safety cap to avoid infinite loops
 
 
 
-async def orchestrate(user_query: str) -> AsyncIterator[str]:
+async def orchestrate(user_query: Union[str, List[dict]]) -> AsyncIterator[str]:
 
     """Run the multi-turn orchestration loop, yielding SSE events."""
 
 
 
-    messages: List[dict] = [
+    if isinstance(user_query, list):
+        safe_history = ensure_string_content(user_query)
+        user_query.clear()
+        user_query.extend(safe_history)
+        messages = user_query
+        if not messages or messages[0].get("role") != "system":
+            messages.insert(0, {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT})
+        else:
+            messages[0]["content"] = ORCHESTRATOR_SYSTEM_PROMPT
+    else:
+        messages = [
+            {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user_query},
+        ]
+    _trim_history_in_place(messages)
 
-        {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
+    event_seq = 0
 
-        {"role": "user", "content": user_query},
+    def _event(
+        payload: Dict[str, Any],
+        turn: int,
+        ui_target: str,
+        phase: str,
+        group: Optional[str] = None,
+        wait_for_ui_ms: Optional[int] = None,
+        visual_component: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        nonlocal event_seq
+        event_seq += 1
 
-    ]
+        wrapped = dict(payload)
+        wrapped["ui_target"] = ui_target
+        if visual_component:
+            wrapped["visual_component"] = visual_component
+
+        sync: Dict[str, Any] = {
+            "turn": turn,
+            "seq": event_seq,
+            "phase": phase,
+        }
+        if group:
+            sync["group"] = group
+        if wait_for_ui_ms is not None:
+            sync["wait_for_ui_ms"] = wait_for_ui_ms
+
+        wrapped["sync"] = sync
+        return wrapped
 
 
 
     for _turn in range(MAX_TURNS):
+        turn_idx = _turn + 1
+        _trim_history_in_place(messages)
 
-        # ── Ask orchestrator: "What is your next action?" ────────────
+        # â”€â”€ Ask orchestrator: "What is your next action?" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        action = await get_next_action(messages)
-
-        messages.append({"role": "assistant", "content": action.model_dump_json()})
-
+        action = _normalize_orchestrator_action(await get_next_action(messages))
+        _append_history_message(messages, "assistant", action.model_dump_json())
 
 
-        # ── NARRATE (optionally with companion content card) ────────
+
+        # â”€â”€ NARRATE (optionally with companion content card) â”€â”€â”€â”€â”€â”€â”€â”€
 
         if action.action == "NARRATE" and action.script:
 
@@ -1502,16 +2643,19 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
             # so the frontend shows it while the audio streams.
 
             if action.content_title:
-
-                yield sse({
-
-                    "type": "content_card",
-
-                    "title": action.content_title,
-
-                    "body": action.content_body or "",
-
-                })
+                yield sse(
+                    _event(
+                        {
+                            "type": "content_card",
+                            "title": action.content_title,
+                            "body": action.content_body or "",
+                        },
+                        turn=turn_idx,
+                        ui_target="CONCEPT",
+                        phase="card",
+                        group=f"turn-{turn_idx}-narrate",
+                    )
+                )
 
 
 
@@ -1519,7 +2663,17 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
             # async for chunk in voice_stream(action.script):
             #     yield sse({"type": "audio_chunk", "data": b64(chunk)})
             # yield sse({"type": "audio_done"})
-            yield sse({"type": "speak", "text": action.script})
+            yield sse(
+                _event(
+                    {"type": "speak", "text": action.script},
+                    turn=turn_idx,
+                    ui_target="CONCEPT",
+                    phase="audio",
+                    group=f"turn-{turn_idx}-narrate",
+                    wait_for_ui_ms=120,
+                )
+            )
+            _append_history_message(messages, "assistant", f"Spoken narration: {action.script}")
 
 
 
@@ -1529,133 +2683,225 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
                 card_note = f" (content card '{action.content_title}' was shown alongside)"
 
-            messages.append(
-
-                {"role": "user", "content": f"Narration delivered to student{card_note}. What is your next action?"}
-
+            _append_history_message(
+                messages,
+                "user",
+                f"Narration delivered to student{card_note}. What is your next action?",
             )
 
 
 
-        # ── SHOW_CONTENT ─────────────────────────────────────────────
+        # â”€â”€ SHOW_CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         elif action.action == "SHOW_CONTENT" and action.content_title:
+            yield sse(
+                _event(
+                    {
+                        "type": "content_card",
+                        "title": action.content_title,
+                        "body": action.content_body or "",
+                    },
+                    turn=turn_idx,
+                    ui_target="CONCEPT",
+                    phase="card",
+                    group=f"turn-{turn_idx}-content",
+                )
+            )
 
-            yield sse({
-
-                "type": "content_card",
-
-                "title": action.content_title,
-
-                "body": action.content_body or "",
-
-            })
 
 
-
-            messages.append({
-
-                "role": "user",
-
-                "content": (
-
+            _append_history_message(
+                messages,
+                "user",
+                (
                     f"Content card '{action.content_title}' shown to student. "
-
                     "What is your next action?"
-
                 ),
-
-            })
-
+            )
 
 
-        # ── SHOW_VISUAL ──────────────────────────────────────────────
+
+        # â”€â”€ SHOW_VISUAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         elif action.action == "SHOW_VISUAL" and action.visual_type and action.visual_spec:
 
             visual = await generate_visual(action.visual_type, action.visual_spec)
-
-            yield sse({
-
-                "type": "visual",
-
-                "visual_type": action.visual_type,
-
-                "payload": visual,
-
-            })
+            visual_component = "MERMAID" if action.visual_type == "MERMAID" else "BROWSER"
+            yield sse(
+                _event(
+                    {
+                        "type": "visual",
+                        "visual_type": action.visual_type,
+                        "payload": visual,
+                    },
+                    turn=turn_idx,
+                    ui_target="VISUAL",
+                    phase="visual",
+                    group=f"turn-{turn_idx}-visual",
+                    visual_component=visual_component,
+                )
+            )
 
 
 
             # Feed visual content back so next narration is context-aware
 
-            messages.append({
-
-                "role": "user",
-
-                "content": (
-
+            _append_history_message(
+                messages,
+                "user",
+                (
                     f"Visual generated and shown to student. Visual data: "
-
                     f"{json.dumps(visual)}. What is your next action?"
-
                 ),
-
-            })
-
+            )
 
 
-        # ── ANIMATE ──────────────────────────────────────────────────
+
+        # â”€â”€ ANIMATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         elif action.action == "ANIMATE" and action.animation_type and action.animation_spec:
+
+            animation_spec = dict(action.animation_spec)
+
+            resolved_array, resolved_source = _resolve_animation_array(
+                animation_spec, messages, action.animation_type
+            )
+            requires_multi_array = _requires_multi_element_array(
+                action.animation_type, str(animation_spec.get("description", "") or "")
+            )
+
+            if resolved_array is not None:
+
+                original_array = animation_spec.get("array")
+
+                animation_spec["array"] = resolved_array
+
+                if resolved_source:
+
+                    logger.warning(
+
+                        "[ANIMATE][ARRAY_FIX] source=%s before=%s after=%s",
+
+                        resolved_source,
+
+                        _safe_dump(original_array, 600),
+
+                        _safe_dump(resolved_array, 600),
+
+                    )
 
             # If the orchestrator already provided frames inline, use them.
 
             # Otherwise, call the animation worker to generate them.
 
-            frames = action.animation_spec.get("frames")
+            frames = animation_spec.get("frames")
+            frame_source = "inline_spec"
 
             if not frames:
 
                 frames = await generate_animation(
 
-                    action.animation_type, action.animation_spec
+                    action.animation_type, animation_spec
 
                 )
+                frame_source = "llm_worker"
+
+            animation_component = _infer_animation_component(
+                action.animation_type, animation_spec
+            )
+
+            if animation_component == "ARRAY":
+                fallback_array = (
+                    resolved_array
+                    if resolved_array and len(resolved_array) >= 1
+                    else _coerce_numeric_array(animation_spec.get("array")) or []
+                )
+                frames = _sanitize_array_frames(
+                    frames,
+                    fallback_array=fallback_array,
+                    requires_multi=requires_multi_array,
+                )
+
+            if resolved_array and len(resolved_array) >= 2 and isinstance(frames, list):
+
+                patched = 0
+
+                for frame in frames:
+
+                    if not isinstance(frame, dict):
+
+                        continue
+
+                    frame_array = frame.get("array")
+
+                    coerced_frame = _coerce_numeric_array(frame_array)
+                    if frame_array is None or _looks_collapsed_singleton_array(frame_array) or (
+                        requires_multi_array and coerced_frame is not None and len(coerced_frame) < 2
+                    ):
+
+                        frame["array"] = list(resolved_array)
+
+                        patched += 1
+
+                if patched:
+
+                    logger.warning(
+
+                        "[ANIMATE][FRAME_ARRAY_FIX] patched=%s replacement=%s",
+
+                        patched,
+
+                        _safe_dump(resolved_array, 600),
+
+                    )
 
 
 
             total = len(frames)
 
-
-
-            # Pre-generate ALL narrations in parallel before the loop.
-
-            # Since narrate_frame already has the full frames list for
-
-            # context, every call is independent — perfect for gather.
-
-            # This turns N sequential LLM round-trips into 1 parallel batch.
-
-            narrations: List[str] = await asyncio.gather(
-
-                *(narrate_frame(messages, frames, i, total) for i in range(total))
-
-            )
+            if animation_component == "ARRAY":
+                narrations = []
+                prev_frame_for_narration: Optional[dict] = None
+                for i, frame in enumerate(frames):
+                    narrations.append(
+                        _deterministic_array_narration(
+                            frame, i, total, prev_frame=prev_frame_for_narration
+                        )
+                    )
+                    prev_frame_for_narration = frame
+            else:
+                # Generate narrations sequentially to avoid provider TPM bursts.
+                narrations = []
+                for i in range(total):
+                    narrations.append(await narrate_frame(messages, frames, i, total))
 
 
 
             # Extract array & target from spec or first frame for the frontend
 
-            array_data = action.animation_spec.get("array", [])
+            array_data = animation_spec.get("array", [])
 
-            target_data = action.animation_spec.get("target")
+            target_data = animation_spec.get("target")
 
             if not array_data and frames:
 
                 array_data = frames[0].get("array", [])
 
+            logger.warning(
 
+                "[ANIMATE][START] source=%s animation_type=%s total=%s start_array_type=%s start_array=%s",
+
+                frame_source,
+
+                action.animation_type,
+
+                total,
+
+                type(array_data).__name__ if array_data is not None else "None",
+
+                _safe_dump(array_data, 600),
+
+            )
 
             start_event: dict = {
 
@@ -1673,61 +2919,105 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
                 start_event["target"] = target_data
 
-            yield sse(start_event)
+            yield sse(
+                _event(
+                    start_event,
+                    turn=turn_idx,
+                    ui_target="VISUAL",
+                    phase="animation_start",
+                    group=f"turn-{turn_idx}-animation",
+                    visual_component=animation_component,
+                )
+            )
 
 
 
             for i, frame in enumerate(frames):
 
+                logger.warning(
+
+                    "[ANIMATE][FRAME] idx=%s array_type=%s array=%s",
+
+                    i,
+
+                    type(frame.get("array")).__name__ if isinstance(frame, dict) else type(frame).__name__,
+
+                    _safe_dump(frame.get("array") if isinstance(frame, dict) else frame, 600),
+
+                )
+
                 # Send the frame to the frontend
 
-                yield sse({
+                yield sse(
+                    _event(
+                        {
+                            "type": "frame",
+                            "index": i,
+                            "total": total,
+                            "payload": frame,
+                        },
+                        turn=turn_idx,
+                        ui_target="VISUAL",
+                        phase="frame",
+                        group=f"turn-{turn_idx}-animation-frame-{i}",
+                        visual_component=animation_component,
+                    )
+                )
 
-                    "type": "frame",
-
-                    "index": i,
-
-                    "total": total,
-
-                    "payload": frame,
-
-                })
 
 
-
-                # Narration is already ready — just stream the audio
+                # Narration is already ready â€” just stream the audio
 
                 # yield sse({"type": "audio_start", "text": narrations[i]})
                 # async for chunk in voice_stream(narrations[i]):
                 #     yield sse({"type": "audio_chunk", "data": b64(chunk)})
                 # yield sse({"type": "audio_done"})
-                yield sse({"type": "speak", "text": narrations[i]})
+                yield sse(
+                    _event(
+                        {"type": "speak", "text": narrations[i]},
+                        turn=turn_idx,
+                        ui_target="VISUAL",
+                        phase="audio",
+                        group=f"turn-{turn_idx}-animation-frame-{i}",
+                        wait_for_ui_ms=90,
+                        visual_component=animation_component,
+                    )
+                )
 
 
 
-            yield sse({"type": "animation_done"})
+            yield sse(
+                _event(
+                    {"type": "animation_done"},
+                    turn=turn_idx,
+                    ui_target="VISUAL",
+                    phase="animation_done",
+                    group=f"turn-{turn_idx}-animation",
+                    visual_component=animation_component,
+                )
+            )
+            _append_history_message(
+                messages,
+                "assistant",
+                f"Spoken animation walkthrough: {_spoken_digest(narrations)}",
+            )
 
 
 
             # Feed the full animation back into context
 
-            messages.append({
-
-                "role": "user",
-
-                "content": (
-
+            _append_history_message(
+                messages,
+                "user",
+                (
                     f"Animation complete ({total} frames shown and narrated). "
-
                     f"Frames: {json.dumps(frames)}. What is your next action?"
-
                 ),
-
-            })
-
+            )
 
 
-        # ── EXPLAIN_CODE ──────────────────────────────────────────────
+
+        # â”€â”€ EXPLAIN_CODE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         elif action.action == "EXPLAIN_CODE" and action.code_spec:
 
@@ -1747,37 +3037,32 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
 
 
-            # Pre-generate ALL segment narrations in parallel (same pattern as animation frames)
-
-            narrations: List[str] = await asyncio.gather(
-
-                *(
-
-                    narrate_code_segment(messages, code, segments, i, total_segments)
-
-                    for i in range(total_segments)
-
+            # Generate narrations sequentially to avoid provider TPM bursts.
+            narrations: List[str] = []
+            for i in range(total_segments):
+                narrations.append(
+                    await narrate_code_segment(messages, code, segments, i, total_segments)
                 )
 
+
+
+            # Emit code_explainer_start â€” frontend creates the code card
+
+            yield sse(
+                _event(
+                    {
+                        "type": "code_explainer_start",
+                        "code": code,
+                        "language": explanation["language"],
+                        "total_segments": total_segments,
+                        "title": title,
+                    },
+                    turn=turn_idx,
+                    ui_target="CODE",
+                    phase="code_start",
+                    group=f"turn-{turn_idx}-code",
+                )
             )
-
-
-
-            # Emit code_explainer_start — frontend creates the code card
-
-            yield sse({
-
-                "type": "code_explainer_start",
-
-                "code": code,
-
-                "language": explanation["language"],
-
-                "total_segments": total_segments,
-
-                "title": title,
-
-            })
 
 
 
@@ -1785,19 +3070,21 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
             for i, segment in enumerate(segments):
 
-                yield sse({
-
-                    "type": "code_segment",
-
-                    "index": i,
-
-                    "total": total_segments,
-
-                    "lines": segment.get("lines", [1, 1]),
-
-                    "explanation": segment.get("explanation", ""),
-
-                })
+                yield sse(
+                    _event(
+                        {
+                            "type": "code_segment",
+                            "index": i,
+                            "total": total_segments,
+                            "lines": segment.get("lines", [1, 1]),
+                            "explanation": segment.get("explanation", ""),
+                        },
+                        turn=turn_idx,
+                        ui_target="CODE",
+                        phase="code_segment",
+                        group=f"turn-{turn_idx}-code-segment-{i}",
+                    )
+                )
 
 
 
@@ -1805,39 +3092,56 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
                 # async for chunk in voice_stream(narrations[i]):
                 #     yield sse({"type": "audio_chunk", "data": b64(chunk)})
                 # yield sse({"type": "audio_done"})
-                yield sse({"type": "speak", "text": narrations[i]})
+                yield sse(
+                    _event(
+                        {"type": "speak", "text": narrations[i]},
+                        turn=turn_idx,
+                        ui_target="CODE",
+                        phase="audio",
+                        group=f"turn-{turn_idx}-code-segment-{i}",
+                        wait_for_ui_ms=90,
+                    )
+                )
 
 
 
-            yield sse({"type": "code_explainer_done"})
+            yield sse(
+                _event(
+                    {"type": "code_explainer_done"},
+                    turn=turn_idx,
+                    ui_target="CODE",
+                    phase="code_done",
+                    group=f"turn-{turn_idx}-code",
+                )
+            )
+            _append_history_message(
+                messages,
+                "assistant",
+                f"Spoken code walkthrough: {_spoken_digest(narrations)}",
+            )
 
 
 
             # Feed context back into conversation
 
-            messages.append({
-
-                "role": "user",
-
-                "content": (
-
+            _append_history_message(
+                messages,
+                "user",
+                (
                     f"Code explanation complete ({total_segments} segments walked through). "
-
                     f"Code: {code[:200]}... Segments: {json.dumps(segments)}. "
-
                     "What is your next action?"
-
                 ),
-
-            })
-
+            )
 
 
-        # ── GRAPH_ANIMATE ────────────────────────────────────────────
+
+        # â”€â”€ GRAPH_ANIMATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         elif action.action == "GRAPH_ANIMATE" and action.graph_spec:
 
             graph_type = action.graph_type or "bfs"
+            graph_component = _infer_graph_component(graph_type)
 
             result = await generate_graph_animation(graph_type, action.graph_spec)
 
@@ -1851,35 +3155,32 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
 
 
-            # Pre-generate ALL narrations in parallel
-
-            narrations: List[str] = await asyncio.gather(
-
-                *(
-
-                    narrate_graph_frame(messages, graph, frames, i, total)
-
-                    for i in range(total)
-
+            # Generate narrations sequentially to avoid provider TPM bursts.
+            narrations: List[str] = []
+            for i in range(total):
+                narrations.append(
+                    await narrate_graph_frame(messages, graph, frames, i, total)
                 )
 
+
+
+            # Emit graph_start â€” frontend creates the graph card
+
+            yield sse(
+                _event(
+                    {
+                        "type": "graph_start",
+                        "graph_type": graph_type,
+                        "total_frames": total,
+                        "graph": graph,
+                    },
+                    turn=turn_idx,
+                    ui_target="VISUAL",
+                    phase="graph_start",
+                    group=f"turn-{turn_idx}-graph",
+                    visual_component=graph_component,
+                )
             )
-
-
-
-            # Emit graph_start — frontend creates the graph card
-
-            yield sse({
-
-                "type": "graph_start",
-
-                "graph_type": graph_type,
-
-                "total_frames": total,
-
-                "graph": graph,
-
-            })
 
 
 
@@ -1887,55 +3188,77 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
                 # Send the frame to the frontend
 
-                yield sse({
+                yield sse(
+                    _event(
+                        {
+                            "type": "graph_frame",
+                            "index": i,
+                            "total": total,
+                            "payload": frame,
+                        },
+                        turn=turn_idx,
+                        ui_target="VISUAL",
+                        phase="graph_frame",
+                        group=f"turn-{turn_idx}-graph-frame-{i}",
+                        visual_component=graph_component,
+                    )
+                )
 
-                    "type": "graph_frame",
-
-                    "index": i,
-
-                    "total": total,
-
-                    "payload": frame,
-
-                })
 
 
-
-                # Narration is already ready — just stream the audio
+                # Narration is already ready â€” just stream the audio
 
                 # yield sse({"type": "audio_start", "text": narrations[i]})
                 # async for chunk in voice_stream(narrations[i]):
                 #     yield sse({"type": "audio_chunk", "data": b64(chunk)})
                 # yield sse({"type": "audio_done"})
-                yield sse({"type": "speak", "text": narrations[i]})
+                yield sse(
+                    _event(
+                        {"type": "speak", "text": narrations[i]},
+                        turn=turn_idx,
+                        ui_target="VISUAL",
+                        phase="audio",
+                        group=f"turn-{turn_idx}-graph-frame-{i}",
+                        wait_for_ui_ms=90,
+                        visual_component=graph_component,
+                    )
+                )
 
 
 
-            yield sse({"type": "graph_done"})
+            yield sse(
+                _event(
+                    {"type": "graph_done"},
+                    turn=turn_idx,
+                    ui_target="VISUAL",
+                    phase="graph_done",
+                    group=f"turn-{turn_idx}-graph",
+                    visual_component=graph_component,
+                )
+            )
+            _append_history_message(
+                messages,
+                "assistant",
+                f"Spoken graph walkthrough: {_spoken_digest(narrations)}",
+            )
 
 
 
             # Feed the full animation back into context
 
-            messages.append({
-
-                "role": "user",
-
-                "content": (
-
+            _append_history_message(
+                messages,
+                "user",
+                (
                     f"Graph animation complete ({total} frames shown and narrated). "
-
                     f"Graph type: {graph_type}. Frames: {json.dumps(frames)}. "
-
                     "What is your next action?"
-
                 ),
-
-            })
-
+            )
 
 
-        # ── CHECKPOINT (The Pause) ──────────────────────────────────
+
+        # â”€â”€ CHECKPOINT (The Pause) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if action.action == "CHECKPOINT":
 
@@ -1947,23 +3270,36 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
                 # async for chunk in voice_stream(action.script):
                 #     yield sse({"type": "audio_chunk", "data": b64(chunk)})
                 # yield sse({"type": "audio_done"})
-                yield sse({"type": "speak", "text": action.script})
+                yield sse(
+                    _event(
+                        {"type": "speak", "text": action.script},
+                        turn=turn_idx,
+                        ui_target="CONCEPT",
+                        phase="audio",
+                        group=f"turn-{turn_idx}-checkpoint",
+                        wait_for_ui_ms=60,
+                    )
+                )
+                _append_history_message(messages, "assistant", f"Spoken checkpoint: {action.script}")
 
 
 
             # 2. Send the UI data for the buttons
 
-            yield sse({
-
-                "type": "checkpoint",
-
-                "title": action.checkpoint_title,
-
-                "options": [opt.model_dump() for opt in action.checkpoint_options or []],
-
-                "history": messages # Send the history back so the frontend can store it
-
-            })
+            yield sse(
+                _event(
+                    {
+                        "type": "checkpoint",
+                        "title": action.checkpoint_title,
+                        "options": [opt.model_dump() for opt in action.checkpoint_options or []],
+                        "history": messages,  # Send the history back so the frontend can store it
+                    },
+                    turn=turn_idx,
+                    ui_target="CONCEPT",
+                    phase="checkpoint",
+                    group=f"turn-{turn_idx}-checkpoint",
+                )
+            )
 
            
 
@@ -1975,11 +3311,18 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
 
 
-        # ── DONE ─────────────────────────────────────────────────────
+        # â”€â”€ DONE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         elif action.action == "DONE":
-
-            yield sse({"type": "done"})
+            yield sse(
+                _event(
+                    {"type": "done"},
+                    turn=turn_idx,
+                    ui_target="CONCEPT",
+                    phase="done",
+                    group=f"turn-{turn_idx}-done",
+                )
+            )
 
             break
 
@@ -1987,23 +3330,29 @@ async def orchestrate(user_query: str) -> AsyncIterator[str]:
 
         else:
 
-            # Unknown or malformed action — ask again
+            # Unknown or malformed action â€” ask again
 
-            messages.append({
-
-                "role": "user",
-
-                "content": "That action was not understood. Please respond with a valid action.",
-
-            })
+            _append_history_message(
+                messages,
+                "user",
+                "That action was not understood. Please respond with a valid action.",
+            )
 
 
 
     else:
 
-        # Exhausted MAX_TURNS — force end
+        # Exhausted MAX_TURNS â€” force end
 
-        yield sse({"type": "done"})
+        yield sse(
+            _event(
+                {"type": "done"},
+                turn=MAX_TURNS,
+                ui_target="CONCEPT",
+                phase="done",
+                group="max-turns",
+            )
+        )
 
 
 
@@ -2041,54 +3390,61 @@ async def chat_endpoint(request: Request):
 
     data = await request.json()
 
-    messages = data.get("messages", [])
+    session_id = str(data.get("session_id") or "").strip()
+    incoming_messages = data.get("messages", [])
+    user_query = str(data.get("message", "") or "").strip()
 
-   
+    if session_id:
+        history = SESSION_MEMORY.setdefault(
+            session_id,
+            [{"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT}],
+        )
 
-    # Filter out UI-only messages like "Setting up your lesson..."
+        # Optional client hydration if explicit history is sent.
+        if isinstance(incoming_messages, list) and incoming_messages:
+            hydrated = [
+                m
+                for m in incoming_messages
+                if m.get("content")
+                and m.get("content") not in ("Setting up your lesson…", "Setting up your lesson...")
+            ]
+            if hydrated:
+                history.clear()
+                history.extend(ensure_string_content(hydrated))
 
-    # and ensure content isn't empty
+        if not history or history[0].get("role") != "system":
+            history.insert(0, {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT})
+        else:
+            history[0]["content"] = ORCHESTRATOR_SYSTEM_PROMPT
 
+        if user_query:
+            history.append({"role": "user", "content": user_query})
+
+        _trim_history_in_place(history)
+
+        return StreamingResponse(
+            orchestrate(history), media_type="text/event-stream"
+        )
+
+    # Stateless fallback when session_id is missing.
+    messages = incoming_messages if isinstance(incoming_messages, list) else []
     messages = [
-
-        m for m in messages
-
-        if m.get("content") and m["content"] != "Setting up your lesson…"
-
+        m
+        for m in messages
+        if m.get("content")
+        and m.get("content") not in ("Setting up your lesson…", "Setting up your lesson...")
     ]
 
-
-
     if not messages:
-
-        user_query = data.get("message", "")
-
         messages = [
-
             {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
-
-            {"role": "user", "content": str(user_query)}
-
+            {"role": "user", "content": user_query},
         ]
-
-   
-
-    # Ensure system prompt is exactly once at the top
-
-    if not messages or messages[0].get("role") != "system":
-
+    elif messages[0].get("role") != "system":
         messages.insert(0, {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT})
-
     else:
-
-        # Update the system prompt in case you've tweaked it since the session started
-
         messages[0]["content"] = ORCHESTRATOR_SYSTEM_PROMPT
 
-
-
     return StreamingResponse(
-
         orchestrate(messages), media_type="text/event-stream"
-
     )

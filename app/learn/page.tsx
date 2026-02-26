@@ -45,7 +45,7 @@ import { cn } from '../../lib/utils';
 
 // --- TYPES ---
 type LayoutMode = 'CONCEPT_MODE' | 'SPLIT_MODE' | 'FOCUS_MODE' | 'VISUAL_MODE';
-type VisualType = 'ARRAY' | 'TABLE' | 'KEY_VALUE' | 'MERMAID_FLOWCHART' | "NETWORK" | "BROWSER";
+type VisualType = 'ARRAY' | 'TREE' | 'TABLE' | 'KEY_VALUE' | 'MERMAID_FLOWCHART' | "NETWORK" | "BROWSER";
 
 interface VisualState {
   type: VisualType;
@@ -76,6 +76,26 @@ type PlaybackAction =
   | { type: 'VISUAL'; state: VisualState } 
   | { type: 'HIGHLIGHT'; code_to_highlight: string } 
   | { type: 'WAIT'; ms: number };
+
+const mapUiTargetToLayout = (uiTarget?: string): LayoutMode | null => {
+  const target = String(uiTarget || '').toUpperCase();
+  if (target === 'CONCEPT') return 'CONCEPT_MODE';
+  if (target === 'CODE') return 'FOCUS_MODE';
+  if (target === 'VISUAL') return 'VISUAL_MODE';
+  return null;
+};
+
+const inferGraphVisualType = (graphType?: string, visualComponent?: string): VisualType => {
+  const hinted = String(visualComponent || '').toUpperCase();
+  if (hinted === 'TREE') return 'TREE';
+  if (hinted === 'NETWORK') return 'NETWORK';
+
+  const kind = String(graphType || '').toLowerCase();
+  if (/(tree|bst|avl|inorder|preorder|postorder|level_order)/.test(kind)) {
+    return 'TREE';
+  }
+  return 'NETWORK';
+};
 
 // --- CONFIGURATION ---
 const ANIMATION_SPRING = { type: "spring", stiffness: 300, damping: 30 };
@@ -555,8 +575,32 @@ const detectLanguage = (code: string): 'python' | 'javascript' => {
   return jsScore > pyScore ? 'javascript' : 'python';
 };
 
+const normalizeArrayPayload = (value: any): any[] => {
+  if (Array.isArray(value)) {
+    let normalized: any = value;
+    while (
+      Array.isArray(normalized) &&
+      normalized.length === 1 &&
+      Array.isArray(normalized[0])
+    ) {
+      normalized = normalized[0];
+    }
+    return Array.isArray(normalized) ? normalized : [];
+  }
+
+  if (typeof value === 'string') {
+    try {
+      return normalizeArrayPayload(JSON.parse(value));
+    } catch {
+      return [];
+    }
+  }
+
+  return [];
+};
+
 const ArrayVisualizer = ({ payload }: { payload: any }) => {
-  const data = payload?.data || [];
+  const data = normalizeArrayPayload(payload?.data);
   const highlights = payload?.highlights || [];
   const pointers = payload?.pointers || {};
   const dimmed_indices = payload?.dimmed_indices || []; 
@@ -625,6 +669,110 @@ const ArrayVisualizer = ({ payload }: { payload: any }) => {
           </AnimatePresence>
         </div>
       </div>
+    </div>
+  );
+};
+
+const TreeVisualizer = ({ payload }: { payload: any }) => {
+  const rawNodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+  const rawLinks = Array.isArray(payload?.links) ? payload.links : [];
+  const activeNodeSet = new Set((payload?.activeNodes || []).map((id: any) => String(id)));
+  const activeEdgeSet = new Set(
+    (payload?.activeEdges || [])
+      .filter((edge: any) => Array.isArray(edge) && edge.length >= 2)
+      .flatMap((edge: any) => {
+        const src = String(edge[0]);
+        const tgt = String(edge[1]);
+        return [`${src}-${tgt}`, `${tgt}-${src}`];
+      })
+  );
+
+  if (!rawNodes.length) {
+    return (
+      <div className="w-full h-full flex items-center justify-center text-xs font-mono text-gray-500 bg-[#0a0a0a]">
+        Waiting for tree frames...
+      </div>
+    );
+  }
+
+  const nodes = rawNodes.map((node: any, idx: number) => ({
+    ...node,
+    id: String(node?.id ?? node?.name ?? node?.label ?? idx),
+    label: String(node?.label ?? node?.id ?? node?.name ?? idx),
+    x: typeof node?.x === 'number' ? node.x : (idx + 1) * 40,
+    y: typeof node?.y === 'number' ? node.y : 40 + Math.floor(idx / 4) * 50,
+  }));
+
+  const nodeById = new Map(nodes.map((node: any) => [node.id, node]));
+  const links = rawLinks
+    .map((link: any) => ({
+      source: String(link?.source?.id ?? link?.source ?? link?.from ?? link?.u ?? ''),
+      target: String(link?.target?.id ?? link?.target ?? link?.to ?? link?.v ?? ''),
+    }))
+    .filter((link: any) => link.source && link.target && nodeById.has(link.source) && nodeById.has(link.target));
+
+  const xs = nodes.map((node: any) => node.x);
+  const ys = nodes.map((node: any) => node.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const spanX = Math.max(maxX - minX, 1);
+  const spanY = Math.max(maxY - minY, 1);
+
+  const projectX = (x: number) => 80 + ((x - minX) / spanX) * 840;
+  const projectY = (y: number) => 70 + ((y - minY) / spanY) * 420;
+
+  return (
+    <div className="relative flex-1 w-full h-full bg-[#0a0a0a] overflow-hidden">
+      <div className="absolute inset-0 bg-[radial-gradient(#80808012_1px,transparent_1px)] [background-size:22px_22px]" />
+      <svg viewBox="0 0 1000 560" className="relative z-10 w-full h-full">
+        {links.map((link: any, idx: number) => {
+          const source = nodeById.get(link.source);
+          const target = nodeById.get(link.target);
+          if (!source || !target) return null;
+          const edgeKey = `${link.source}-${link.target}`;
+          const isActive = activeEdgeSet.has(edgeKey);
+          return (
+            <line
+              key={`${edgeKey}-${idx}`}
+              x1={projectX(source.x)}
+              y1={projectY(source.y)}
+              x2={projectX(target.x)}
+              y2={projectY(target.y)}
+              stroke={isActive ? '#22d3ee' : '#3f3f46'}
+              strokeWidth={isActive ? 4 : 2}
+              strokeLinecap="round"
+            />
+          );
+        })}
+
+        {nodes.map((node: any) => {
+          const isActive = activeNodeSet.has(node.id);
+          const x = projectX(node.x);
+          const y = projectY(node.y);
+          return (
+            <g key={node.id}>
+              <circle
+                cx={x}
+                cy={y}
+                r={isActive ? 24 : 20}
+                fill={isActive ? 'rgba(34, 211, 238, 0.22)' : 'rgba(39, 39, 42, 0.8)'}
+                stroke={isActive ? '#22d3ee' : '#52525b'}
+                strokeWidth={isActive ? 3 : 2}
+              />
+              <text
+                x={x}
+                y={y + 5}
+                textAnchor="middle"
+                className={cn("font-mono text-sm", isActive ? "fill-cyan-100" : "fill-zinc-300")}
+              >
+                {node.label}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
     </div>
   );
 };
@@ -818,6 +966,7 @@ const [showShareOverlay, setShowShareOverlay] = useState(false); // <--- ADD THI
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const latestCodeRef = useRef<string>("");
   const graphBaseRef = useRef<any>(null);
+  const currentGraphVisualTypeRef = useRef<VisualType>('NETWORK');
   const pendingBackendAudioTextRef = useRef<string>("");
   const pendingBackendAudioChunksRef = useRef<string[]>([]);
   
@@ -1188,6 +1337,7 @@ const incrementUsage = async (messageText: string) => {
       if (!data) return null;
       switch (data.type) {
           case 'ARRAY': return <ArrayVisualizer payload={data.payload} />;
+          case 'TREE': return <TreeVisualizer payload={data.payload} />;
           case 'TABLE': return <TableVisualizer payload={data.payload} />;
           case 'MERMAID_FLOWCHART': return <MermaidChart chart={data.payload.chart} />;
           case 'NETWORK': return <ForceGraph data={data.payload} />;
@@ -1224,11 +1374,23 @@ const incrementUsage = async (messageText: string) => {
       };
     });
 
-    const links = rawLinks.map((link: any) => ({
-      ...link,
-      source: String(link?.source ?? link?.from ?? link?.u ?? ''),
-      target: String(link?.target ?? link?.to ?? link?.v ?? ''),
-    }));
+    const links = rawLinks
+      .map((link: any) => {
+        if (Array.isArray(link) && link.length >= 2) {
+          return { source: String(link[0]), target: String(link[1]) };
+        }
+
+        if (link && typeof link === 'object') {
+          return {
+            ...link,
+            source: String(link?.source ?? link?.from ?? link?.u ?? ''),
+            target: String(link?.target ?? link?.to ?? link?.v ?? ''),
+          };
+        }
+
+        return { source: '', target: '' };
+      })
+      .filter((link: any) => link.source && link.target);
 
     return { nodes, links };
   };
@@ -1237,7 +1399,9 @@ const incrementUsage = async (messageText: string) => {
     const candidates = [
       framePayload?.active_nodes,
       framePayload?.activeNodes,
+      framePayload?.activeNode,
       framePayload?.visited,
+      framePayload?.visitedNodes,
       framePayload?.frontier,
       framePayload?.current,
       framePayload?.node,
@@ -1255,10 +1419,19 @@ const incrementUsage = async (messageText: string) => {
   };
 
   const parseActiveEdges = (framePayload: any): string[][] => {
-    const edgeCandidates = framePayload?.active_edges ?? framePayload?.activeEdges ?? framePayload?.edges ?? [];
-    if (!Array.isArray(edgeCandidates)) return [];
+    const edgeCandidates = [
+      framePayload?.active_edges,
+      framePayload?.activeEdges,
+      framePayload?.activeEdge,
+      framePayload?.visitedEdges,
+      framePayload?.edges,
+    ];
 
     return edgeCandidates
+      .flatMap((candidate: any) => {
+        if (candidate === null || candidate === undefined) return [];
+        return Array.isArray(candidate) ? candidate : [candidate];
+      })
       .map((edge: any) => {
         if (Array.isArray(edge) && edge.length >= 2) return [String(edge[0]), String(edge[1])];
         if (edge && typeof edge === 'object') {
@@ -1362,10 +1535,11 @@ const incrementUsage = async (messageText: string) => {
         case 'CONCEPT':
           setConceptHistory(prev => {
              const last = prev[prev.length - 1];
-             if (last.title === action.title && last.text === action.text) return prev;
-             return [...prev, { title: action.title, text: action.text }];
+             if (last?.title === action.title && last?.text === action.text) return prev;
+             const next = [...prev, { title: action.title, text: action.text }];
+             setConceptIndex(next.length - 1);
+             return next;
           });
-          setConceptIndex(prev => prev + 1); 
           break;
         case 'VISUAL': 
           setVisualHistory(prev => {
@@ -1482,6 +1656,21 @@ const incrementUsage = async (messageText: string) => {
     try {
       const cleanLine = line.replace(/^data: /, '');
       const data = JSON.parse(cleanLine);
+      const uiLayout = mapUiTargetToLayout(data.ui_target);
+
+      if (data.type === 'speak') {
+        if (uiLayout) {
+          queueAction({ type: 'LAYOUT', mode: uiLayout });
+        }
+
+        const waitForUiMs = Number(data?.sync?.wait_for_ui_ms ?? 0);
+        if (Number.isFinite(waitForUiMs) && waitForUiMs > 0) {
+          queueAction({ type: 'WAIT', ms: waitForUiMs });
+        }
+
+        queueAction({ type: 'SPEAK', text: String(data.text || '') });
+        return;
+      }
 
       if (data.type === 'audio_start') {
         pendingBackendAudioTextRef.current = data.text || '';
@@ -1507,6 +1696,7 @@ const incrementUsage = async (messageText: string) => {
       }
 
       if (data.type === 'content_card') {
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'CONCEPT_MODE' });
         queueAction({
           type: 'CONCEPT',
           title: data.title || 'Learning Note',
@@ -1517,7 +1707,7 @@ const incrementUsage = async (messageText: string) => {
 
       if (data.type === 'visual') {
         if (data.visual_type === 'MERMAID') {
-          queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+          queueAction({ type: 'LAYOUT', mode: uiLayout || 'VISUAL_MODE' });
           queueAction({
             type: 'VISUAL',
             state: {
@@ -1530,7 +1720,7 @@ const incrementUsage = async (messageText: string) => {
         }
 
         if (data.visual_type === 'BROWSER') {
-          queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+          queueAction({ type: 'LAYOUT', mode: uiLayout || 'VISUAL_MODE' });
           queueAction({
             type: 'VISUAL',
             state: {
@@ -1544,7 +1734,7 @@ const incrementUsage = async (messageText: string) => {
       }
 
       if (data.type === 'animation_start') {
-        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'VISUAL_MODE' });
         queueAction({
           type: 'CONCEPT',
           title: 'Animation Started',
@@ -1555,7 +1745,8 @@ const incrementUsage = async (messageText: string) => {
 
       if (data.type === 'frame') {
         const framePayload = data.payload || {};
-        const arrayData: any[] = Array.isArray(framePayload.array) ? framePayload.array : [];
+        const frameVisualType: VisualType = String(data.visual_component || '').toUpperCase() === 'TREE' ? 'TREE' : 'ARRAY';
+        const arrayData: any[] = normalizeArrayPayload(framePayload.array);
         const activeRange = Array.isArray(framePayload.activeRange) ? framePayload.activeRange : null;
         const dimmedIndices = activeRange
           ? arrayData
@@ -1563,20 +1754,36 @@ const incrementUsage = async (messageText: string) => {
               .filter((idx: number) => idx < activeRange[0] || idx > activeRange[1])
           : [];
 
-        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
-        queueAction({
-          type: 'VISUAL',
-          state: {
-            type: 'ARRAY',
-            payload: {
-              data: arrayData,
-              pointers: framePayload.pointers || {},
-              highlights: framePayload.highlights || [],
-              dimmed_indices: dimmedIndices,
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'VISUAL_MODE' });
+        if (frameVisualType === 'TREE') {
+          queueAction({
+            type: 'VISUAL',
+            state: {
+              type: 'TREE',
+              payload: {
+                nodes: Array.isArray(framePayload.nodes) ? framePayload.nodes : [],
+                links: Array.isArray(framePayload.links) ? framePayload.links : [],
+                activeNodes: parseActiveNodes(framePayload),
+                activeEdges: parseActiveEdges(framePayload),
+              },
+              caption: framePayload.label || `Frame ${(data.index ?? 0) + 1}`,
             },
-            caption: framePayload.label || `Frame ${(data.index ?? 0) + 1}`,
-          },
-        });
+          });
+        } else {
+          queueAction({
+            type: 'VISUAL',
+            state: {
+              type: 'ARRAY',
+              payload: {
+                data: arrayData,
+                pointers: framePayload.pointers || {},
+                highlights: framePayload.highlights || [],
+                dimmed_indices: dimmedIndices,
+              },
+              caption: framePayload.label || `Frame ${(data.index ?? 0) + 1}`,
+            },
+          });
+        }
 
         if (framePayload.label) {
           queueAction({
@@ -1589,7 +1796,7 @@ const incrementUsage = async (messageText: string) => {
       }
 
       if (data.type === 'code_explainer_start') {
-        queueAction({ type: 'LAYOUT', mode: 'FOCUS_MODE' });
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'FOCUS_MODE' });
         queueAction({ type: 'CODE', code: data.code || '' });
         if (data.title) {
           queueAction({
@@ -1602,6 +1809,7 @@ const incrementUsage = async (messageText: string) => {
       }
 
       if (data.type === 'code_segment') {
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'FOCUS_MODE' });
         const [startLine, endLine] = Array.isArray(data.lines) ? data.lines : [1, 1];
         const codeLines = latestCodeRef.current.split('\n');
         const highlightSource = codeLines[Math.max(0, (startLine || 1) - 1)] || '';
@@ -1621,12 +1829,14 @@ const incrementUsage = async (messageText: string) => {
 
       if (data.type === 'graph_start') {
         const normalizedGraph = parseGraphData(data.graph || {});
+        const graphVisualType = inferGraphVisualType(data.graph_type, data.visual_component);
+        currentGraphVisualTypeRef.current = graphVisualType;
         graphBaseRef.current = normalizedGraph;
-        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'VISUAL_MODE' });
         queueAction({
           type: 'VISUAL',
           state: {
-            type: 'NETWORK',
+            type: graphVisualType,
             payload: {
               ...normalizedGraph,
               activeNodes: [],
@@ -1641,11 +1851,11 @@ const incrementUsage = async (messageText: string) => {
       if (data.type === 'graph_frame') {
         const framePayload = data.payload || {};
         const baseGraph = graphBaseRef.current || { nodes: [], links: [] };
-        queueAction({ type: 'LAYOUT', mode: 'VISUAL_MODE' });
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'VISUAL_MODE' });
         queueAction({
           type: 'VISUAL',
           state: {
-            type: 'NETWORK',
+            type: currentGraphVisualTypeRef.current,
             payload: {
               ...baseGraph,
               activeNodes: parseActiveNodes(framePayload),
@@ -1666,6 +1876,7 @@ const incrementUsage = async (messageText: string) => {
       }
 
       if (data.type === 'checkpoint') {
+        queueAction({ type: 'LAYOUT', mode: uiLayout || 'CONCEPT_MODE' });
         const optionLabels = Array.isArray(data.options)
           ? data.options.map((opt: any) => `• ${opt.label}`).join('\n')
           : '';
@@ -1678,7 +1889,6 @@ const incrementUsage = async (messageText: string) => {
       }
 
       const map: Record<string, PlaybackAction> = {
-        'speak': { type: 'SPEAK', text: data.text },
         'layout': { type: 'LAYOUT', mode: data.mode },
         'code': { type: 'CODE', code: data.content },
         'concept': { type: 'CONCEPT', title: data.title, text: data.text },
